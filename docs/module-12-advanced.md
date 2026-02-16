@@ -925,6 +925,10 @@ if env.options.xtrace {
 }
 ```
 
+> **See also:** Module 21 (Diagnostics & Logging) extends xtrace into a full
+> feature-flagged tracing system with structured events, per-subsystem
+> filtering, file logging, and a command audit trail.
+
 ### Integrating `nounset`
 
 During variable expansion, if a variable is not set:
