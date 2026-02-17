@@ -884,6 +884,11 @@ pub fn builtin_set(args: &[&str], env: &mut ShellEnv) -> i32 {
 }
 ```
 
+> **See also:** Module 22 (Output Formatting & Global Configuration) adds
+> `shopt` -- an extended option system for feature toggles like `dotglob`,
+> `autocd`, `color_header`, and more, plus a `config` command for runtime
+> and persistent settings.
+
 ### Integrating `errexit`
 
 In the main evaluation loop, check after each command:

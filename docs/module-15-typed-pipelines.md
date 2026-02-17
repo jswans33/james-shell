@@ -1136,6 +1136,11 @@ fn format_table_truncated(
 }
 ```
 
+> **See also:** Module 22 (Output Formatting & Global Configuration) extends
+> this table renderer with color control (`--color=auto/always/never`),
+> display mode switching (table/JSON/CSV/compact/raw), automatic pager
+> integration, and Unicode-aware column widths.
+
 ---
 
 ## Concept 9: Converting between structured and text
