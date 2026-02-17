@@ -11,7 +11,7 @@
 | 3 | Process Execution | **Done** | v0.3.0 |
 | 4 | Built-in Commands | **Done** | v0.4.0 |
 | 5 | Environment Variables & Expansion | **Done** | v0.5.0 |
-| 6 | I/O Redirection | Pending | — |
+| 6 | I/O Redirection | **Done** | v0.6.0 |
 | 7 | Pipes | Pending | — |
 
 ### Phase 2: Polish & UX (Modules 8–10)

@@ -2,6 +2,7 @@ mod builtins;
 mod executor;
 mod expander;
 mod parser;
+mod redirect;
 
 use std::io::{self, Write};
 
@@ -42,12 +43,26 @@ fn main() {
                     continue;
                 }
 
-                // Build a Command from expanded args
+                // Separate redirect operators from regular arguments
+                let (args, redirections) = match redirect::extract_redirections(&args) {
+                    Ok(pair) => pair,
+                    Err(msg) => {
+                        eprintln!("{msg}");
+                        last_exit_code = 2;
+                        continue;
+                    }
+                };
+
+                if args.is_empty() {
+                    continue;
+                }
+
+                // Build a Command from expanded args and execute with redirections
                 let cmd = parser::Command {
                     program: args[0].clone(),
                     args: args[1..].to_vec(),
                 };
-                last_exit_code = executor::execute(&cmd);
+                last_exit_code = executor::execute(&cmd, &redirections);
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {
                 continue;

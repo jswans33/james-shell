@@ -33,6 +33,39 @@ enum State {
     InSingleQuote,
 }
 
+/// Consume a redirect operator starting with `>` or `<`.
+/// Handles multi-character operators: >>, <<<, >&N
+fn consume_redirect_op(first: char, chars: &mut std::iter::Peekable<std::str::Chars>) -> String {
+    let mut op = String::new();
+    op.push(first);
+
+    match first {
+        '>' => {
+            if chars.peek() == Some(&'>') {
+                op.push(chars.next().unwrap()); // >>
+            } else if chars.peek() == Some(&'&') {
+                op.push(chars.next().unwrap()); // >&
+                // Consume the fd number (e.g., >&1, >&2)
+                if let Some(&c) = chars.peek()
+                    && c.is_ascii_digit()
+                {
+                    op.push(chars.next().unwrap());
+                }
+            }
+        }
+        '<' => {
+            if chars.peek() == Some(&'<') {
+                op.push(chars.next().unwrap()); // <<
+                if chars.peek() == Some(&'<') {
+                    op.push(chars.next().unwrap()); // <<<
+                }
+            }
+        }
+        _ => {}
+    }
+    op
+}
+
 /// Tokenize input into a list of words, each preserving quote context.
 pub fn tokenize(input: &str) -> Vec<Word> {
     let mut words: Vec<Word> = Vec::new();
@@ -60,6 +93,11 @@ pub fn tokenize(input: &str) -> Vec<Word> {
                     current_word.push(WordSegment::SingleQuoted("\\".to_string()));
                 }
                 state = State::InWord;
+            }
+            (State::Normal, '>' | '<') => {
+                // Redirect operator — emit as its own token
+                let op = consume_redirect_op(ch, &mut chars);
+                words.push(vec![WordSegment::Unquoted(op)]);
             }
             (State::Normal, c) => {
                 current_segment.push(c);
@@ -100,6 +138,18 @@ pub fn tokenize(input: &str) -> Vec<Word> {
                 } else {
                     current_word.push(WordSegment::SingleQuoted("\\".to_string()));
                 }
+            }
+            (State::InWord, '>' | '<') => {
+                // Redirect operator breaks the current word
+                if !current_segment.is_empty() {
+                    current_word.push(WordSegment::Unquoted(std::mem::take(&mut current_segment)));
+                }
+                if !current_word.is_empty() {
+                    words.push(std::mem::take(&mut current_word));
+                }
+                let op = consume_redirect_op(ch, &mut chars);
+                words.push(vec![WordSegment::Unquoted(op)]);
+                state = State::Normal;
             }
             (State::InWord, c) => {
                 current_segment.push(c);
