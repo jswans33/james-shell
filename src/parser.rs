@@ -48,6 +48,9 @@ pub fn tokenize(input: &str) -> Vec<String> {
                 // Escape: take the next character literally
                 if let Some(next) = chars.next() {
                     current.push(next);
+                } else {
+                    // Trailing backslash at EOF — keep it literal
+                    current.push('\\');
                 }
                 state = State::InWord;
             }
@@ -75,6 +78,9 @@ pub fn tokenize(input: &str) -> Vec<String> {
                 // Escape: take the next character literally
                 if let Some(next) = chars.next() {
                     current.push(next);
+                } else {
+                    // Trailing backslash at EOF — keep it literal
+                    current.push('\\');
                 }
             }
             (State::InWord, c) => {
@@ -114,9 +120,13 @@ pub fn tokenize(input: &str) -> Vec<String> {
         }
     }
 
-    // Don't forget the last token if we were mid-word
-    if !current.is_empty() {
-        tokens.push(current);
+    // Flush the last token. We emit even if current is empty when in InWord,
+    // because closing a quote (e.g. echo "") transitions to InWord with an
+    // empty buffer — that empty string is a valid argument.
+    match state {
+        State::InWord => tokens.push(current),
+        _ if !current.is_empty() => tokens.push(current),
+        _ => {}
     }
 
     tokens
@@ -211,5 +221,41 @@ mod tests {
         // Single quotes: backslash is literal
         let tokens = tokenize(r"'hello\nworld'");
         assert_eq!(tokens, vec![r"hello\nworld"]);
+    }
+
+    #[test]
+    fn empty_double_quoted_arg() {
+        // echo "" should have one empty-string argument
+        let cmd = parse(r#"echo """#).unwrap();
+        assert_eq!(cmd.program, "echo");
+        assert_eq!(cmd.args, vec![""]);
+    }
+
+    #[test]
+    fn empty_single_quoted_arg() {
+        let cmd = parse("echo ''").unwrap();
+        assert_eq!(cmd.program, "echo");
+        assert_eq!(cmd.args, vec![""]);
+    }
+
+    #[test]
+    fn multiple_empty_quoted_args() {
+        let cmd = parse(r#"cmd "" '' """#).unwrap();
+        assert_eq!(cmd.program, "cmd");
+        assert_eq!(cmd.args, vec!["", "", ""]);
+    }
+
+    #[test]
+    fn trailing_backslash_in_word() {
+        // Trailing backslash with no next char should be kept literal
+        let tokens = tokenize(r"foo\");
+        assert_eq!(tokens, vec![r"foo\"]);
+    }
+
+    #[test]
+    fn trailing_backslash_standalone() {
+        // Just a backslash by itself
+        let tokens = tokenize(r"\");
+        assert_eq!(tokens, vec![r"\"]);
     }
 }
