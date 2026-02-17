@@ -1,13 +1,13 @@
 # james-shell — Progress Tracker
 
-## Current Module: 1 — The REPL Loop
+## Current Module: 2 — Command Parsing & Tokenization
 
 ### Phase 1: Traditional Shell Foundation (Modules 1–7)
 
 | Module | Title | Status | Git Tag |
 |--------|-------|--------|---------|
-| 1 | The REPL Loop | **In Progress** | — |
-| 2 | Command Parsing & Tokenization | Pending | — |
+| 1 | The REPL Loop | **Done** | v0.1.0 |
+| 2 | Command Parsing & Tokenization | **In Progress** | — |
 | 3 | Process Execution | Pending | — |
 | 4 | Built-in Commands | Pending | — |
 | 5 | Environment Variables & Expansion | Pending | — |
