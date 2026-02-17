@@ -75,11 +75,16 @@ fn builtin_pwd() -> i32 {
 }
 
 fn builtin_exit(args: &[String]) -> i32 {
-    let code = args
-        .first()
-        .and_then(|s| s.parse::<i32>().ok())
-        .unwrap_or(0);
-    std::process::exit(code);
+    match args.first() {
+        None => std::process::exit(0),
+        Some(s) => match s.parse::<i32>() {
+            Ok(code) => std::process::exit(code),
+            Err(_) => {
+                eprintln!("exit: {s}: numeric argument required");
+                2
+            }
+        },
+    }
 }
 
 fn builtin_echo(args: &[String]) -> i32 {
@@ -126,6 +131,27 @@ fn builtin_type(args: &[String]) -> i32 {
     exit_code
 }
 
+/// Check if a path points to an executable file.
+fn is_executable(path: &Path) -> bool {
+    let Ok(meta) = path.metadata() else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+
+    // On Unix, check the executable permission bits
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        return meta.permissions().mode() & 0o111 != 0;
+    }
+
+    // On Windows, being a file with the right extension is sufficient
+    #[cfg(not(unix))]
+    true
+}
+
 /// Search PATH for an executable with the given name.
 fn find_in_path(cmd: &str) -> Option<PathBuf> {
     let path_var = std::env::var("PATH").ok()?;
@@ -133,14 +159,14 @@ fn find_in_path(cmd: &str) -> Option<PathBuf> {
 
     for dir in path_var.split(separator) {
         let full_path = Path::new(dir).join(cmd);
-        if full_path.exists() {
+        if is_executable(&full_path) {
             return Some(full_path);
         }
         // On Windows, also try common executable extensions
         if cfg!(windows) {
             for ext in &["exe", "cmd", "bat", "com"] {
                 let with_ext = full_path.with_extension(ext);
-                if with_ext.exists() {
+                if is_executable(&with_ext) {
                     return Some(with_ext);
                 }
             }
