@@ -37,6 +37,10 @@ fn main() {
                     last_exit_code = executor::execute(&cmd);
                 }
             }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                // Ctrl-C interrupted the read — just re-prompt
+                continue;
+            }
             Err(error) => {
                 eprintln!("Error reading input: {error}");
                 break;
