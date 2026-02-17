@@ -1,9 +1,4 @@
-mod builtins;
-mod executor;
-mod expander;
-mod parser;
-mod redirect;
-
+use james_shell::{executor, expander, parser, redirect};
 use std::io::{self, Write};
 
 fn main() {
@@ -35,17 +30,17 @@ fn main() {
                     continue;
                 }
 
-                // Parse into quote-aware words, then expand
-                let words = parser::parse_words(trimmed);
-                let args = expander::expand_words(&words, last_exit_code);
-
-                if args.is_empty() {
-                    continue;
-                }
-
-                // Separate redirect operators from regular arguments
-                let (args, redirections) = match redirect::extract_redirections(&args) {
-                    Ok(pair) => pair,
+                // Parse into quote-aware words and split pipeline segments.
+                let words = match parser::parse_words(trimmed) {
+                    Ok(words) => words,
+                    Err(msg) => {
+                        eprintln!("{msg}");
+                        last_exit_code = 2;
+                        continue;
+                    }
+                };
+                let pipeline_words = match parser::split_pipeline(&words) {
+                    Ok(words) => words,
                     Err(msg) => {
                         eprintln!("{msg}");
                         last_exit_code = 2;
@@ -53,16 +48,62 @@ fn main() {
                     }
                 };
 
-                if args.is_empty() {
+                let mut commands = Vec::new();
+                let mut had_parse_error = false;
+
+                for segment_words in pipeline_words {
+                    let (words, redirections) = match
+                        redirect::extract_redirections_from_words(&segment_words, last_exit_code)
+                    {
+                        Ok(pair) => pair,
+                        Err(msg) => {
+                            eprintln!("{msg}");
+                            last_exit_code = 2;
+                            had_parse_error = true;
+                            break;
+                        }
+                    };
+
+                    let args = expander::expand_words(&words, last_exit_code);
+                    if args.is_empty() {
+                        eprintln!("jsh: syntax error: empty command");
+                        last_exit_code = 2;
+                        had_parse_error = true;
+                        break;
+                    }
+
+                    // Build a Command from expanded args and execute with redirections.
+                    let command = parser::Command {
+                        program: args[0].clone(),
+                        args: args[1..].to_vec(),
+                    };
+                    commands.push(executor::PipelineCommand { command, redirections });
+                }
+
+                if had_parse_error || commands.is_empty() {
+                    if commands.is_empty() && !had_parse_error && last_exit_code == 0 {
+                        // Should only occur for malformed input we couldn't parse as a segment.
+                        last_exit_code = 2;
+                    }
                     continue;
                 }
 
-                // Build a Command from expanded args and execute with redirections
-                let cmd = parser::Command {
-                    program: args[0].clone(),
-                    args: args[1..].to_vec(),
+                let action = if commands.len() == 1 {
+                    let command = commands.swap_remove(0);
+                    executor::execute(&command.command, &command.redirections)
+                } else {
+                    executor::execute_pipeline(commands)
                 };
-                last_exit_code = executor::execute(&cmd, &redirections);
+
+                match action {
+                    executor::ExecutionAction::Continue(code) => {
+                        last_exit_code = code;
+                    }
+                    executor::ExecutionAction::Exit(code) => {
+                        last_exit_code = code;
+                        break;
+                    }
+                }
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {
                 continue;

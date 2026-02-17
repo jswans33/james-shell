@@ -1,6 +1,6 @@
 # james-shell — Progress Tracker
 
-## Current Module: 5 — Environment Variables & Expansion
+## Current Module: 8 — Job Control
 
 ### Phase 1: Traditional Shell Foundation (Modules 1–7)
 
@@ -12,7 +12,7 @@
 | 4 | Built-in Commands | **Done** | v0.4.0 |
 | 5 | Environment Variables & Expansion | **Done** | v0.5.0 |
 | 6 | I/O Redirection | **Done** | v0.6.0 |
-| 7 | Pipes | Pending | — |
+| 7 | Pipes | **Done** | v0.7.0 |
 
 ### Phase 2: Polish & UX (Modules 8–10)
 

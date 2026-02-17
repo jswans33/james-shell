@@ -12,37 +12,86 @@ pub fn expand_words(words: &[Word], last_exit_code: i32) -> Vec<String> {
 
 /// Expand a single word (which may have mixed quoting) into one or more strings.
 fn expand_word(segments: &[WordSegment], last_exit_code: i32) -> Vec<String> {
-    let mut combined = String::new();
-    let mut is_globbable = false;
+    let mut partials: Vec<(String, bool)> = vec![(String::new(), false)];
 
     for segment in segments {
-        match segment {
-            WordSegment::SingleQuoted(text) => {
-                // No expansion — everything literal
-                combined.push_str(text);
-            }
+        let replacements: Vec<(String, bool)> = match segment {
+            WordSegment::SingleQuoted(text) => vec![(text.clone(), false)],
             WordSegment::DoubleQuoted(text) => {
-                // Variable expansion only — no tilde, no glob
-                let expanded = expand_variables(text, last_exit_code);
-                combined.push_str(&expanded);
+                vec![(expand_variables(text, last_exit_code), false)]
             }
             WordSegment::Unquoted(text) => {
-                // Full expansion pipeline: tilde → variable → (mark for glob)
-                let expanded = expand_tilde(text);
-                let expanded = expand_variables(&expanded, last_exit_code);
-                if contains_glob_chars(&expanded) {
-                    is_globbable = true;
-                }
-                combined.push_str(&expanded);
+                let expanded = expand_variables(&expand_tilde(text), last_exit_code);
+                let split_fields = if has_unquoted_expansion(text) {
+                    let split: Vec<String> = expanded.split_whitespace().map(str::to_string).collect();
+                    if split.is_empty() {
+                        vec![String::new()]
+                    } else {
+                        split
+                    }
+                } else {
+                    vec![expanded]
+                };
+
+                split_fields.into_iter().map(|field| (field, true)).collect()
             }
+        };
+
+        let mut next: Vec<(String, bool)> = Vec::with_capacity(
+            partials.len().saturating_mul(replacements.len()),
+        );
+
+        for (base, base_glob) in partials {
+            for (field, field_glob) in &replacements {
+                next.push((format!("{base}{field}"), base_glob || *field_glob));
+            }
+        }
+
+        partials = next;
+    }
+
+    partials
+        .into_iter()
+        .flat_map(|(text, can_glob)| {
+            if can_glob && contains_glob_chars(&text) {
+                expand_globs(&text).into_iter().collect::<Vec<_>>()
+            } else {
+                vec![text]
+            }
+        })
+        .collect()
+}
+
+fn has_unquoted_expansion(text: &str) -> bool {
+    let mut chars = text.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch != '$' {
+            continue;
+        }
+
+        match chars.peek() {
+            None => continue,
+            Some('?') | Some('$') | Some('0') => return true,
+            Some(&'{') => {
+                chars.next();
+                let mut has_end = false;
+                for c in chars.by_ref() {
+                    if c == '}' {
+                        has_end = true;
+                        break;
+                    }
+                }
+                if has_end {
+                    return true;
+                }
+            }
+            Some(c) if c.is_ascii_alphabetic() || *c == '_' => return true,
+            _ => {}
         }
     }
 
-    if is_globbable {
-        expand_globs(&combined)
-    } else {
-        vec![combined]
-    }
+    false
 }
 
 // ── Tilde Expansion ──
@@ -104,8 +153,20 @@ fn expand_variables(input: &str, last_exit_code: i32) -> String {
             }
             Some(&'{') => {
                 chars.next(); // consume '{'
-                let name: String = chars.by_ref().take_while(|c| *c != '}').collect();
-                if name.is_empty() {
+                let mut name = String::new();
+                let mut closed = false;
+                while let Some(c) = chars.next() {
+                    if c == '}' {
+                        closed = true;
+                        break;
+                    }
+                    name.push(c);
+                }
+
+                if !closed {
+                    result.push_str("${");
+                    result.push_str(&name);
+                } else if name.is_empty() {
                     result.push_str("${}");
                 } else {
                     let value = std::env::var(&name).unwrap_or_default();
@@ -206,6 +267,12 @@ mod tests {
     }
 
     #[test]
+    fn variable_braced_missing_close_is_literal() {
+        let result = expand_variables("${JSH_MISSING", 0);
+        assert_eq!(result, "${JSH_MISSING");
+    }
+
+    #[test]
     fn variable_exit_code() {
         assert_eq!(expand_variables("$?", 42), "42");
         assert_eq!(expand_variables("$?", 0), "0");
@@ -266,5 +333,23 @@ mod tests {
     fn no_glob_matches_keeps_literal() {
         let result = expand_globs("*.definitely_not_a_real_extension_xyz");
         assert_eq!(result, vec!["*.definitely_not_a_real_extension_xyz"]);
+    }
+
+    #[test]
+    fn word_split_for_unquoted_variable() {
+        unsafe { std::env::set_var("JSH_SPLIT_TEST", "alpha beta") };
+        let word = vec![WordSegment::Unquoted("$JSH_SPLIT_TEST".into())];
+        let result = expand_word(&word, 0);
+        assert_eq!(result, vec!["alpha", "beta"]);
+        unsafe { std::env::remove_var("JSH_SPLIT_TEST") };
+    }
+
+    #[test]
+    fn no_word_split_in_quotes() {
+        unsafe { std::env::set_var("JSH_SPLIT_TEST", "alpha beta") };
+        let word = vec![WordSegment::DoubleQuoted("$JSH_SPLIT_TEST".into())];
+        let result = expand_word(&word, 0);
+        assert_eq!(result, vec!["alpha beta"]);
+        unsafe { std::env::remove_var("JSH_SPLIT_TEST") };
     }
 }

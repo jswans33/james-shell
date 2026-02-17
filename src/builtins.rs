@@ -4,6 +4,12 @@ use std::path::{Path, PathBuf};
 /// The list of all builtin command names.
 const BUILTINS: &[&str] = &["cd", "pwd", "exit", "echo", "export", "unset", "type"];
 
+#[derive(Debug)]
+pub enum BuiltinAction {
+    Continue(i32),
+    Exit(i32),
+}
+
 /// Returns true if the command name is a shell builtin.
 pub fn is_builtin(name: &str) -> bool {
     BUILTINS.contains(&name)
@@ -16,18 +22,18 @@ pub fn execute(
     args: &[String],
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
-) -> i32 {
+) -> BuiltinAction {
     match program {
-        "cd" => builtin_cd(args, stderr),
-        "pwd" => builtin_pwd(stdout, stderr),
+        "cd" => BuiltinAction::Continue(builtin_cd(args, stderr)),
+        "pwd" => BuiltinAction::Continue(builtin_pwd(stdout, stderr)),
         "exit" => builtin_exit(args, stderr),
-        "echo" => builtin_echo(args, stdout),
-        "export" => builtin_export(args, stderr),
-        "unset" => builtin_unset(args),
-        "type" => builtin_type(args, stdout, stderr),
+        "echo" => BuiltinAction::Continue(builtin_echo(args, stdout)),
+        "export" => BuiltinAction::Continue(builtin_export(args, stderr)),
+        "unset" => BuiltinAction::Continue(builtin_unset(args)),
+        "type" => BuiltinAction::Continue(builtin_type(args, stdout, stderr)),
         _ => {
             let _ = writeln!(stderr, "jsh: unknown builtin: {program}");
-            1
+            BuiltinAction::Continue(1)
         }
     }
 }
@@ -81,14 +87,14 @@ fn builtin_pwd(stdout: &mut dyn Write, stderr: &mut dyn Write) -> i32 {
     }
 }
 
-fn builtin_exit(args: &[String], stderr: &mut dyn Write) -> i32 {
+fn builtin_exit(args: &[String], stderr: &mut dyn Write) -> BuiltinAction {
     match args.first() {
-        None => std::process::exit(0),
+        None => BuiltinAction::Exit(0),
         Some(s) => match s.parse::<i32>() {
-            Ok(code) => std::process::exit(code),
+            Ok(code) => BuiltinAction::Exit(code),
             Err(_) => {
                 let _ = writeln!(stderr, "exit: {s}: numeric argument required");
-                std::process::exit(2);
+                BuiltinAction::Exit(2)
             }
         },
     }
@@ -163,14 +169,17 @@ fn is_executable(path: &Path) -> bool {
             Some(ext) => ext.to_ascii_lowercase(),
             None => return false,
         };
-
-        let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| {
-            ".COM;.EXE;.BAT;.CMD".to_string()
-        });
-        pathext
-            .split(';')
-            .any(|ext| extension == ext.trim_start_matches('.').to_ascii_lowercase())
+        is_windows_executable_extension(&extension)
     }
+}
+
+#[cfg(not(unix))]
+fn is_windows_executable_extension(extension: &str) -> bool {
+    let pathext = std::env::var("PATHEXT")
+        .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+    pathext
+        .split(';')
+        .any(|ext| extension == ext.trim_start_matches('.').to_ascii_lowercase())
 }
 
 /// Search PATH for an executable with the given name.
@@ -183,9 +192,11 @@ fn find_in_path(cmd: &str) -> Option<PathBuf> {
         if is_executable(&full_path) {
             return Some(full_path);
         }
-        // On Windows, also try common executable extensions
+        // On Windows, also try PATHEXT-configured executable extensions.
         if cfg!(windows) {
-            for ext in &["exe", "cmd", "bat", "com"] {
+            let exts = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+            let exts = exts.split(';').map(|ext| ext.trim_start_matches('.').to_ascii_lowercase());
+            for ext in exts {
                 let with_ext = full_path.with_extension(ext);
                 if is_executable(&with_ext) {
                     return Some(with_ext);
