@@ -1,6 +1,6 @@
 # james-shell — Progress Tracker
 
-## Current Module: 3 — Process Execution
+## Current Module: 5 — Environment Variables & Expansion
 
 ### Phase 1: Traditional Shell Foundation (Modules 1–7)
 
@@ -9,7 +9,7 @@
 | 1 | The REPL Loop | **Done** | v0.1.0 |
 | 2 | Command Parsing & Tokenization | **Done** | v0.2.0 |
 | 3 | Process Execution | **Done** | v0.3.0 |
-| 4 | Built-in Commands | Pending | — |
+| 4 | Built-in Commands | **Done** | v0.4.0 |
 | 5 | Environment Variables & Expansion | Pending | — |
 | 6 | I/O Redirection | Pending | — |
 | 7 | Pipes | Pending | — |

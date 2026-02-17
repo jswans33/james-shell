@@ -1,3 +1,4 @@
+mod builtins;
 mod executor;
 mod parser;
 

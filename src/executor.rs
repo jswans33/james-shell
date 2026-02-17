@@ -1,5 +1,6 @@
 use std::process::Command;
 
+use crate::builtins;
 use crate::parser;
 
 /// Derive an exit code from a process status.
@@ -10,7 +11,6 @@ fn exit_code(status: std::process::ExitStatus) -> i32 {
         return code;
     }
 
-    // On Unix, a signal-terminated process has no exit code but has a signal number.
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt;
@@ -22,9 +22,18 @@ fn exit_code(status: std::process::ExitStatus) -> i32 {
     1
 }
 
-/// Execute a parsed command by spawning an OS process.
-/// Returns the exit code (0 = success, 127 = not found, 128+N = killed by signal N).
+/// Execute a parsed command — builtins first, then external programs.
+/// Returns the exit code.
 pub fn execute(cmd: &parser::Command) -> i32 {
+    if builtins::is_builtin(&cmd.program) {
+        return builtins::execute(&cmd.program, &cmd.args);
+    }
+
+    run_external(cmd)
+}
+
+/// Spawn an external program as a child process.
+fn run_external(cmd: &parser::Command) -> i32 {
     match Command::new(&cmd.program).args(&cmd.args).status() {
         Ok(status) => exit_code(status),
         Err(e) => {
