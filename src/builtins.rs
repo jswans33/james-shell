@@ -81,7 +81,7 @@ fn builtin_exit(args: &[String]) -> i32 {
             Ok(code) => std::process::exit(code),
             Err(_) => {
                 eprintln!("exit: {s}: numeric argument required");
-                2
+                std::process::exit(2);
             }
         },
     }
@@ -149,7 +149,19 @@ fn is_executable(path: &Path) -> bool {
 
     // On Windows, being a file with the right extension is sufficient
     #[cfg(not(unix))]
-    true
+    {
+        let extension = match path.extension().and_then(|ext| ext.to_str()) {
+            Some(ext) => ext.to_ascii_lowercase(),
+            None => return false,
+        };
+
+        let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| {
+            ".COM;.EXE;.BAT;.CMD".to_string()
+        });
+        pathext
+            .split(';')
+            .any(|ext| extension == ext.trim_start_matches('.').to_ascii_lowercase())
+    }
 }
 
 /// Search PATH for an executable with the given name.
