@@ -1,9 +1,9 @@
+mod executor;
 mod parser;
 
 use std::io::{self, Write};
 
 fn main() {
-    // Set up Ctrl-C handler so it doesn't kill the shell.
     ctrlc::set_handler(|| {
         println!();
         let _ = io::stdout().flush();
@@ -12,6 +12,7 @@ fn main() {
 
     let stdin = io::stdin();
     let mut stdout = io::stdout();
+    let mut last_exit_code: i32 = 0;
 
     loop {
         print!("jsh> ");
@@ -31,10 +32,8 @@ fn main() {
                     continue;
                 }
 
-                // Parse the input into a structured Command
-                match parser::parse(trimmed) {
-                    Some(cmd) => println!("{cmd:?}"),
-                    None => continue,
+                if let Some(cmd) = parser::parse(trimmed) {
+                    last_exit_code = executor::execute(&cmd);
                 }
             }
             Err(error) => {
@@ -43,4 +42,6 @@ fn main() {
             }
         }
     }
+
+    std::process::exit(last_exit_code);
 }
