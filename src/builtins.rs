@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// The list of all builtin command names.
@@ -8,31 +9,37 @@ pub fn is_builtin(name: &str) -> bool {
     BUILTINS.contains(&name)
 }
 
-/// Execute a builtin command. Returns the exit code.
-pub fn execute(program: &str, args: &[String]) -> i32 {
+/// Execute a builtin command, writing output to the provided streams.
+/// Returns the exit code.
+pub fn execute(
+    program: &str,
+    args: &[String],
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> i32 {
     match program {
-        "cd" => builtin_cd(args),
-        "pwd" => builtin_pwd(),
-        "exit" => builtin_exit(args),
-        "echo" => builtin_echo(args),
-        "export" => builtin_export(args),
+        "cd" => builtin_cd(args, stderr),
+        "pwd" => builtin_pwd(stdout, stderr),
+        "exit" => builtin_exit(args, stderr),
+        "echo" => builtin_echo(args, stdout),
+        "export" => builtin_export(args, stderr),
         "unset" => builtin_unset(args),
-        "type" => builtin_type(args),
+        "type" => builtin_type(args, stdout, stderr),
         _ => {
-            eprintln!("jsh: unknown builtin: {program}");
+            let _ = writeln!(stderr, "jsh: unknown builtin: {program}");
             1
         }
     }
 }
 
-fn builtin_cd(args: &[String]) -> i32 {
+fn builtin_cd(args: &[String], stderr: &mut dyn Write) -> i32 {
     let target = match args.first() {
         Some(dir) if dir == "-" => {
             // cd - : go to previous directory
             match std::env::var("OLDPWD") {
                 Ok(prev) => prev,
                 Err(_) => {
-                    eprintln!("cd: OLDPWD not set");
+                    let _ = writeln!(stderr, "cd: OLDPWD not set");
                     return 1;
                 }
             }
@@ -54,52 +61,52 @@ fn builtin_cd(args: &[String]) -> i32 {
     }
 
     if let Err(e) = std::env::set_current_dir(&target) {
-        eprintln!("cd: {target}: {e}");
+        let _ = writeln!(stderr, "cd: {target}: {e}");
         return 1;
     }
 
     0
 }
 
-fn builtin_pwd() -> i32 {
+fn builtin_pwd(stdout: &mut dyn Write, stderr: &mut dyn Write) -> i32 {
     match std::env::current_dir() {
         Ok(path) => {
-            println!("{}", path.display());
+            let _ = writeln!(stdout, "{}", path.display());
             0
         }
         Err(e) => {
-            eprintln!("pwd: {e}");
+            let _ = writeln!(stderr, "pwd: {e}");
             1
         }
     }
 }
 
-fn builtin_exit(args: &[String]) -> i32 {
+fn builtin_exit(args: &[String], stderr: &mut dyn Write) -> i32 {
     match args.first() {
         None => std::process::exit(0),
         Some(s) => match s.parse::<i32>() {
             Ok(code) => std::process::exit(code),
             Err(_) => {
-                eprintln!("exit: {s}: numeric argument required");
+                let _ = writeln!(stderr, "exit: {s}: numeric argument required");
                 std::process::exit(2);
             }
         },
     }
 }
 
-fn builtin_echo(args: &[String]) -> i32 {
-    println!("{}", args.join(" "));
+fn builtin_echo(args: &[String], stdout: &mut dyn Write) -> i32 {
+    let _ = writeln!(stdout, "{}", args.join(" "));
     0
 }
 
-fn builtin_export(args: &[String]) -> i32 {
+fn builtin_export(args: &[String], stderr: &mut dyn Write) -> i32 {
     for arg in args {
         if let Some((key, value)) = arg.split_once('=') {
             // SAFETY: Env var mutation only happens on the main thread.
             unsafe { std::env::set_var(key, value) };
         } else {
             // export VAR with no value — just mark for export (no-op for now)
-            eprintln!("export: usage: export VAR=value");
+            let _ = writeln!(stderr, "export: usage: export VAR=value");
         }
     }
     0
@@ -113,16 +120,18 @@ fn builtin_unset(args: &[String]) -> i32 {
     0
 }
 
-fn builtin_type(args: &[String]) -> i32 {
+fn builtin_type(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write) -> i32 {
     let mut exit_code = 0;
     for arg in args {
         if is_builtin(arg) {
-            println!("{arg} is a shell builtin");
+            let _ = writeln!(stdout, "{arg} is a shell builtin");
         } else {
             match find_in_path(arg) {
-                Some(path) => println!("{arg} is {}", path.display()),
+                Some(path) => {
+                    let _ = writeln!(stdout, "{arg} is {}", path.display());
+                }
                 None => {
-                    eprintln!("{arg}: not found");
+                    let _ = writeln!(stderr, "{arg}: not found");
                     exit_code = 1;
                 }
             }

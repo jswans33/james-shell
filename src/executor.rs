@@ -1,5 +1,5 @@
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{self, Write};
 use std::process::{Command, Stdio};
 
 use crate::builtins;
@@ -37,15 +37,124 @@ enum StdioTarget {
     FilePath(String, bool),
 }
 
+/// A pair of writers for stdout and stderr.
+type WriterPair = (Box<dyn Write>, Box<dyn Write>);
+
 /// Execute a parsed command with optional redirections.
 /// Builtins are checked first, then external programs.
 pub fn execute(cmd: &parser::Command, redirections: &[Redirection]) -> i32 {
     if builtins::is_builtin(&cmd.program) {
-        return builtins::execute(&cmd.program, &cmd.args);
+        return run_builtin(cmd, redirections);
     }
 
     run_external(cmd, redirections)
 }
+
+// ── Builtin execution with redirections ──
+
+/// Run a builtin command, routing its output through redirect targets.
+fn run_builtin(cmd: &parser::Command, redirections: &[Redirection]) -> i32 {
+    // Resolve redirections into writers for stdout and stderr
+    let (mut stdout_writer, mut stderr_writer) = match open_builtin_writers(redirections) {
+        Ok(pair) => pair,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return 1;
+        }
+    };
+
+    builtins::execute(
+        &cmd.program,
+        &cmd.args,
+        stdout_writer.as_mut(),
+        stderr_writer.as_mut(),
+    )
+}
+
+/// Resolve redirections into boxed writers for builtins.
+/// Processes redirections left-to-right, tracking targets for fd duplication.
+fn open_builtin_writers(
+    redirections: &[Redirection],
+) -> Result<WriterPair, String> {
+    let mut stdout_target = StdioTarget::Inherit;
+    let mut stderr_target = StdioTarget::Inherit;
+
+    for redir in redirections {
+        match (&redir.target, redir.fd) {
+            // fd duplicated to itself — no-op (e.g. >&1, 2>&2)
+            (RedirectTarget::Fd(target), fd) if *target == fd => {}
+
+            (RedirectTarget::File(path), 1) => {
+                stdout_target = if is_null_device(path) {
+                    StdioTarget::Null
+                } else {
+                    StdioTarget::FilePath(path.clone(), false)
+                };
+            }
+            (RedirectTarget::FileAppend(path), 1) => {
+                stdout_target = StdioTarget::FilePath(path.clone(), true);
+            }
+            (RedirectTarget::File(path), 2) => {
+                stderr_target = if is_null_device(path) {
+                    StdioTarget::Null
+                } else {
+                    StdioTarget::FilePath(path.clone(), false)
+                };
+            }
+            (RedirectTarget::FileAppend(path), 2) => {
+                stderr_target = StdioTarget::FilePath(path.clone(), true);
+            }
+            (RedirectTarget::Fd(1), 2) => {
+                stderr_target = stdout_target.clone();
+            }
+            (RedirectTarget::Fd(2), 1) => {
+                stdout_target = stderr_target.clone();
+            }
+            // Builtins don't support stdin redirection (< and <<<)
+            (RedirectTarget::FileRead(_) | RedirectTarget::HereString(_), 0) => {}
+            _ => {
+                return Err(format!(
+                    "jsh: unsupported redirection: fd {} -> {:?}",
+                    redir.fd, redir.target
+                ));
+            }
+        }
+    }
+
+    let stdout_writer: Box<dyn Write> = open_writer(&stdout_target, "stdout")?;
+    let stderr_writer: Box<dyn Write> = open_writer(&stderr_target, "stderr")?;
+
+    Ok((stdout_writer, stderr_writer))
+}
+
+/// Open a writer for a given StdioTarget.
+fn open_writer(target: &StdioTarget, label: &str) -> Result<Box<dyn Write>, String> {
+    match target {
+        StdioTarget::Inherit => {
+            if label == "stderr" {
+                Ok(Box::new(io::stderr()))
+            } else {
+                Ok(Box::new(io::stdout()))
+            }
+        }
+        StdioTarget::Null => Ok(Box::new(io::sink())),
+        StdioTarget::FilePath(path, append) => {
+            let file = if *append {
+                OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+            } else {
+                File::create(path)
+            };
+            Ok(Box::new(
+                file.map_err(|e| format!("jsh: {path}: {e}"))?,
+            ))
+        }
+    }
+}
+
+// ── External command execution with redirections ──
 
 /// Spawn an external program with I/O redirections applied.
 fn run_external(cmd: &parser::Command, redirections: &[Redirection]) -> i32 {
@@ -100,6 +209,9 @@ fn apply_redirections(
 
     for redir in redirections {
         match (&redir.target, redir.fd) {
+            // ── fd duplicated to itself — no-op ──
+            (RedirectTarget::Fd(target), fd) if *target == fd => {}
+
             // ── stdout > file (truncate) ──
             (RedirectTarget::File(path), 1) => {
                 if is_null_device(path) {

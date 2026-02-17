@@ -140,14 +140,30 @@ pub fn tokenize(input: &str) -> Vec<Word> {
                 }
             }
             (State::InWord, '>' | '<') => {
-                // Redirect operator breaks the current word
-                if !current_segment.is_empty() {
-                    current_word.push(WordSegment::Unquoted(std::mem::take(&mut current_segment)));
+                // Check if the current segment is a lone fd digit (e.g. "2" in "2>&1").
+                // If so, merge it into the operator token instead of emitting as a word.
+                let fd_prefix = if ch == '>'
+                    && current_word.is_empty()
+                    && current_segment.len() == 1
+                    && current_segment.chars().next().unwrap().is_ascii_digit()
+                {
+                    let prefix = std::mem::take(&mut current_segment);
+                    Some(prefix)
+                } else {
+                    // Flush the current segment/word normally
+                    if !current_segment.is_empty() {
+                        current_word.push(WordSegment::Unquoted(std::mem::take(&mut current_segment)));
+                    }
+                    if !current_word.is_empty() {
+                        words.push(std::mem::take(&mut current_word));
+                    }
+                    None
+                };
+
+                let mut op = consume_redirect_op(ch, &mut chars);
+                if let Some(prefix) = fd_prefix {
+                    op = format!("{prefix}{op}");
                 }
-                if !current_word.is_empty() {
-                    words.push(std::mem::take(&mut current_word));
-                }
-                let op = consume_redirect_op(ch, &mut chars);
                 words.push(vec![WordSegment::Unquoted(op)]);
                 state = State::Normal;
             }
@@ -440,5 +456,53 @@ mod tests {
         let words = tokenize("echo '$HOME");
         assert_eq!(words.len(), 2);
         assert!(words[1].iter().any(|seg| matches!(seg, WordSegment::SingleQuoted(s) if s == "$HOME")));
+    }
+
+    // ── Redirect operator tokenization tests ──
+
+    #[test]
+    fn fd_prefix_merged_with_redirect() {
+        // "2>" should be a single token, not "2" + ">"
+        let strings = words_to_strings(&tokenize("ls 2>err.txt"));
+        assert_eq!(strings, vec!["ls", "2>", "err.txt"]);
+    }
+
+    #[test]
+    fn fd_prefix_merged_with_append() {
+        let strings = words_to_strings(&tokenize("ls 2>>err.txt"));
+        assert_eq!(strings, vec!["ls", "2>>", "err.txt"]);
+    }
+
+    #[test]
+    fn fd_prefix_merged_with_dup() {
+        // "2>&1" should be a single token
+        let strings = words_to_strings(&tokenize("ls 2>&1"));
+        assert_eq!(strings, vec!["ls", "2>&1"]);
+    }
+
+    #[test]
+    fn fd_prefix_1_merged_with_dup() {
+        let strings = words_to_strings(&tokenize("echo err 1>&2"));
+        assert_eq!(strings, vec!["echo", "err", "1>&2"]);
+    }
+
+    #[test]
+    fn plain_redirect_no_fd_prefix() {
+        let strings = words_to_strings(&tokenize("echo hello > out.txt"));
+        assert_eq!(strings, vec!["echo", "hello", ">", "out.txt"]);
+    }
+
+    #[test]
+    fn multi_digit_not_merged() {
+        // "12>" — only single-digit fd prefixes are merged
+        let strings = words_to_strings(&tokenize("12>file"));
+        assert_eq!(strings, vec!["12", ">", "file"]);
+    }
+
+    #[test]
+    fn stdin_redirect_not_merged_with_digit() {
+        // Only > merges with fd prefix, not <
+        let strings = words_to_strings(&tokenize("sort < data.txt"));
+        assert_eq!(strings, vec!["sort", "<", "data.txt"]);
     }
 }
