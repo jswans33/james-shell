@@ -884,6 +884,11 @@ pub fn builtin_set(args: &[&str], env: &mut ShellEnv) -> i32 {
 }
 ```
 
+> **See also:** Module 22 (Output Formatting & Global Configuration) adds
+> `shopt` -- an extended option system for feature toggles like `dotglob`,
+> `autocd`, `color_header`, and more, plus a `config` command for runtime
+> and persistent settings.
+
 ### Integrating `errexit`
 
 In the main evaluation loop, check after each command:
@@ -924,6 +929,10 @@ if env.options.xtrace {
     eprintln!("+ {}", cmd.argv.join(" "));
 }
 ```
+
+> **See also:** Module 21 (Diagnostics & Logging) extends xtrace into a full
+> feature-flagged tracing system with structured events, per-subsystem
+> filtering, file logging, and a command audit trail.
 
 ### Integrating `nounset`
 
