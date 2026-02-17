@@ -1,5 +1,6 @@
 mod builtins;
 mod executor;
+mod expander;
 mod parser;
 
 use std::io::{self, Write};
@@ -33,12 +34,22 @@ fn main() {
                     continue;
                 }
 
-                if let Some(cmd) = parser::parse(trimmed) {
-                    last_exit_code = executor::execute(&cmd);
+                // Parse into quote-aware words, then expand
+                let words = parser::parse_words(trimmed);
+                let args = expander::expand_words(&words, last_exit_code);
+
+                if args.is_empty() {
+                    continue;
                 }
+
+                // Build a Command from expanded args
+                let cmd = parser::Command {
+                    program: args[0].clone(),
+                    args: args[1..].to_vec(),
+                };
+                last_exit_code = executor::execute(&cmd);
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {
-                // Ctrl-C interrupted the read — just re-prompt
                 continue;
             }
             Err(error) => {

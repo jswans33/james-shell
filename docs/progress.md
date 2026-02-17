@@ -10,7 +10,7 @@
 | 2 | Command Parsing & Tokenization | **Done** | v0.2.0 |
 | 3 | Process Execution | **Done** | v0.3.0 |
 | 4 | Built-in Commands | **Done** | v0.4.0 |
-| 5 | Environment Variables & Expansion | Pending | — |
+| 5 | Environment Variables & Expansion | **Done** | v0.5.0 |
 | 6 | I/O Redirection | Pending | — |
 | 7 | Pipes | Pending | — |
 

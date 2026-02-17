@@ -1,3 +1,19 @@
+/// A segment of a word, tagged with its quote context.
+/// The expander uses this to decide what expansions to apply.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WordSegment {
+    /// Unquoted text — all expansions apply (tilde, variable, glob, word split)
+    Unquoted(String),
+    /// Double-quoted text — variable expansion only, no glob or word split
+    DoubleQuoted(String),
+    /// Single-quoted text — no expansion at all, everything literal
+    SingleQuoted(String),
+}
+
+/// A single word (argument) made up of one or more segments.
+/// Mixed quoting like `he"llo"'world'` produces multiple segments in one word.
+pub type Word = Vec<WordSegment>;
+
 /// A parsed command with a program name and its arguments.
 #[derive(Debug)]
 pub struct Command {
@@ -17,134 +33,167 @@ enum State {
     InSingleQuote,
 }
 
-/// Tokenize a shell input line into a list of words.
-///
-/// Handles:
-/// - Unquoted words split by whitespace
-/// - Double-quoted strings ("hello world" → one token)
-/// - Single-quoted strings ('hello world' → one token)
-/// - Backslash escapes (hello\ world → one token)
-pub fn tokenize(input: &str) -> Vec<String> {
-    let mut tokens: Vec<String> = Vec::new();
-    let mut current = String::new();
+/// Tokenize input into a list of words, each preserving quote context.
+pub fn tokenize(input: &str) -> Vec<Word> {
+    let mut words: Vec<Word> = Vec::new();
+    let mut current_segment = String::new();
+    let mut current_word: Word = Vec::new();
     let mut state = State::Normal;
     let mut chars = input.chars().peekable();
 
     while let Some(ch) = chars.next() {
         match (&state, ch) {
             // ── Normal state: between tokens ──
-            (State::Normal, ' ' | '\t') => {
-                // Skip whitespace between tokens
-            }
+            (State::Normal, ' ' | '\t') => {}
             (State::Normal, '"') => {
-                // Start a double-quoted string
                 state = State::InDoubleQuote;
             }
             (State::Normal, '\'') => {
-                // Start a single-quoted string
                 state = State::InSingleQuote;
             }
             (State::Normal, '\\') => {
-                // Escape: take the next character literally
                 if let Some(next) = chars.next() {
-                    current.push(next);
+                    current_segment.push(next);
                 } else {
-                    // Trailing backslash at EOF — keep it literal
-                    current.push('\\');
+                    current_segment.push('\\');
                 }
                 state = State::InWord;
             }
             (State::Normal, c) => {
-                // Start a new word
-                current.push(c);
+                current_segment.push(c);
                 state = State::InWord;
             }
 
             // ── InWord state: building an unquoted token ──
             (State::InWord, ' ' | '\t') => {
-                // Whitespace ends the current word
-                tokens.push(std::mem::take(&mut current));
+                // Finish current unquoted segment and word
+                if !current_segment.is_empty() {
+                    current_word.push(WordSegment::Unquoted(std::mem::take(&mut current_segment)));
+                }
+                if !current_word.is_empty() {
+                    words.push(std::mem::take(&mut current_word));
+                }
                 state = State::Normal;
             }
             (State::InWord, '"') => {
-                // Transition into double quotes mid-word (e.g., wo"rld")
+                // Flush unquoted segment, switch to double quotes
+                if !current_segment.is_empty() {
+                    current_word.push(WordSegment::Unquoted(std::mem::take(&mut current_segment)));
+                }
                 state = State::InDoubleQuote;
             }
             (State::InWord, '\'') => {
-                // Transition into single quotes mid-word
+                if !current_segment.is_empty() {
+                    current_word.push(WordSegment::Unquoted(std::mem::take(&mut current_segment)));
+                }
                 state = State::InSingleQuote;
             }
             (State::InWord, '\\') => {
-                // Escape: take the next character literally
                 if let Some(next) = chars.next() {
-                    current.push(next);
+                    current_segment.push(next);
                 } else {
-                    // Trailing backslash at EOF — keep it literal
-                    current.push('\\');
+                    current_segment.push('\\');
                 }
             }
             (State::InWord, c) => {
-                current.push(c);
+                current_segment.push(c);
             }
 
             // ── InDoubleQuote state: inside "..." ──
             (State::InDoubleQuote, '"') => {
-                // Closing quote — return to InWord (there might be more after the quote)
+                // Flush double-quoted segment (even if empty — "" is a valid empty arg)
+                current_word.push(WordSegment::DoubleQuoted(std::mem::take(&mut current_segment)));
                 state = State::InWord;
             }
             (State::InDoubleQuote, '\\') => {
-                // Inside double quotes, backslash only escapes: \ " $ ` newline
                 match chars.peek() {
                     Some(&'"' | &'\\' | &'$' | &'`') => {
-                        current.push(chars.next().unwrap());
+                        current_segment.push(chars.next().unwrap());
                     }
                     _ => {
-                        // Backslash is literal if not followed by a special char
-                        current.push('\\');
+                        current_segment.push('\\');
                     }
                 }
             }
             (State::InDoubleQuote, c) => {
-                current.push(c);
+                current_segment.push(c);
             }
 
             // ── InSingleQuote state: inside '...' ──
             (State::InSingleQuote, '\'') => {
-                // Closing quote
+                // Flush single-quoted segment (even if empty)
+                current_word.push(WordSegment::SingleQuoted(std::mem::take(&mut current_segment)));
                 state = State::InWord;
             }
             (State::InSingleQuote, c) => {
-                // Everything is literal inside single quotes — no escaping at all
-                current.push(c);
+                current_segment.push(c);
             }
         }
     }
 
-    // Flush the last token. We emit even if current is empty when in InWord,
-    // because closing a quote (e.g. echo "") transitions to InWord with an
-    // empty buffer — that empty string is a valid argument.
+    // Flush remaining segment and word
     match state {
-        State::InWord => tokens.push(current),
-        _ if !current.is_empty() => tokens.push(current),
-        _ => {}
+        State::InWord => {
+            if !current_segment.is_empty() {
+                current_word.push(WordSegment::Unquoted(std::mem::take(&mut current_segment)));
+            }
+            // Push word even if segments produced empty text (e.g. trailing "")
+            if !current_word.is_empty() {
+                words.push(current_word);
+            }
+        }
+        State::InDoubleQuote | State::InSingleQuote => {
+            // Unclosed quote — flush what we have
+            if !current_segment.is_empty() {
+                current_word.push(WordSegment::Unquoted(current_segment));
+            }
+            if !current_word.is_empty() {
+                words.push(current_word);
+            }
+        }
+        State::Normal => {}
     }
 
-    tokens
+    words
 }
 
-/// Parse a shell input line into a Command.
-/// Returns None if the input is empty after tokenization.
-pub fn parse(input: &str) -> Option<Command> {
-    let tokens = tokenize(input);
+/// Flatten words into plain strings, discarding quote context.
+#[cfg(test)]
+pub fn words_to_strings(words: &[Word]) -> Vec<String> {
+    words
+        .iter()
+        .map(|word| {
+            word.iter()
+                .map(|seg| match seg {
+                    WordSegment::Unquoted(s)
+                    | WordSegment::DoubleQuoted(s)
+                    | WordSegment::SingleQuoted(s) => s.as_str(),
+                })
+                .collect()
+        })
+        .collect()
+}
 
-    if tokens.is_empty() {
+/// Parse a shell input line into a Command (flat strings, no expansion).
+#[cfg(test)]
+pub fn parse(input: &str) -> Option<Command> {
+    let words = tokenize(input);
+    let strings = words_to_strings(&words);
+
+    if strings.is_empty() {
         return None;
     }
 
     Some(Command {
-        program: tokens[0].clone(),
-        args: tokens[1..].to_vec(),
+        program: strings[0].clone(),
+        args: strings[1..].to_vec(),
     })
+}
+
+/// Parse input into raw words with quote context preserved.
+/// Used by the expander pipeline.
+pub fn parse_words(input: &str) -> Vec<Word> {
+    tokenize(input)
 }
 
 #[cfg(test)]
@@ -201,31 +250,27 @@ mod tests {
 
     #[test]
     fn quotes_mid_word() {
-        // e.g., he"llo wor"ld → hello world  (one token)
-        let tokens = tokenize(r#"he"llo wor"ld"#);
-        assert_eq!(tokens, vec!["hello world"]);
+        let strings = words_to_strings(&tokenize(r#"he"llo wor"ld"#));
+        assert_eq!(strings, vec!["hello world"]);
     }
 
     #[test]
     fn backslash_in_double_quotes() {
-        // Inside double quotes, \\ → \ and \" → "
-        let tokens = tokenize(r#""hello\\world""#);
-        assert_eq!(tokens, vec![r"hello\world"]);
+        let strings = words_to_strings(&tokenize(r#""hello\\world""#));
+        assert_eq!(strings, vec![r"hello\world"]);
 
-        let tokens = tokenize(r#""hello\"world""#);
-        assert_eq!(tokens, vec![r#"hello"world"#]);
+        let strings = words_to_strings(&tokenize(r#""hello\"world""#));
+        assert_eq!(strings, vec![r#"hello"world"#]);
     }
 
     #[test]
     fn single_quotes_no_escaping() {
-        // Single quotes: backslash is literal
-        let tokens = tokenize(r"'hello\nworld'");
-        assert_eq!(tokens, vec![r"hello\nworld"]);
+        let strings = words_to_strings(&tokenize(r"'hello\nworld'"));
+        assert_eq!(strings, vec![r"hello\nworld"]);
     }
 
     #[test]
     fn empty_double_quoted_arg() {
-        // echo "" should have one empty-string argument
         let cmd = parse(r#"echo """#).unwrap();
         assert_eq!(cmd.program, "echo");
         assert_eq!(cmd.args, vec![""]);
@@ -247,15 +292,35 @@ mod tests {
 
     #[test]
     fn trailing_backslash_in_word() {
-        // Trailing backslash with no next char should be kept literal
-        let tokens = tokenize(r"foo\");
-        assert_eq!(tokens, vec![r"foo\"]);
+        let strings = words_to_strings(&tokenize(r"foo\"));
+        assert_eq!(strings, vec![r"foo\"]);
     }
 
     #[test]
     fn trailing_backslash_standalone() {
-        // Just a backslash by itself
-        let tokens = tokenize(r"\");
-        assert_eq!(tokens, vec![r"\"]);
+        let strings = words_to_strings(&tokenize(r"\"));
+        assert_eq!(strings, vec![r"\"]);
+    }
+
+    // ── Quote context tests ──
+
+    #[test]
+    fn quote_context_preserved() {
+        let words = tokenize(r#"echo "hello" '$HOME'"#);
+        assert_eq!(words.len(), 3);
+        assert_eq!(words[0], vec![WordSegment::Unquoted("echo".into())]);
+        assert_eq!(words[1], vec![WordSegment::DoubleQuoted("hello".into())]);
+        assert_eq!(words[2], vec![WordSegment::SingleQuoted("$HOME".into())]);
+    }
+
+    #[test]
+    fn mixed_quote_segments() {
+        let words = tokenize(r#"he"llo"'world'"#);
+        assert_eq!(words.len(), 1);
+        assert_eq!(words[0], vec![
+            WordSegment::Unquoted("he".into()),
+            WordSegment::DoubleQuoted("llo".into()),
+            WordSegment::SingleQuoted("world".into()),
+        ]);
     }
 }
