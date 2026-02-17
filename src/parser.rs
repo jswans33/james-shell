@@ -52,10 +52,12 @@ pub fn tokenize(input: &str) -> Vec<Word> {
                 state = State::InSingleQuote;
             }
             (State::Normal, '\\') => {
+                // Escaped char is literal — emit as SingleQuoted so expander
+                // won't touch it (e.g., \$VAR stays as $VAR, not expanded)
                 if let Some(next) = chars.next() {
-                    current_segment.push(next);
+                    current_word.push(WordSegment::SingleQuoted(next.to_string()));
                 } else {
-                    current_segment.push('\\');
+                    current_word.push(WordSegment::SingleQuoted("\\".to_string()));
                 }
                 state = State::InWord;
             }
@@ -89,10 +91,14 @@ pub fn tokenize(input: &str) -> Vec<Word> {
                 state = State::InSingleQuote;
             }
             (State::InWord, '\\') => {
+                // Flush current unquoted segment, emit escaped char as literal
+                if !current_segment.is_empty() {
+                    current_word.push(WordSegment::Unquoted(std::mem::take(&mut current_segment)));
+                }
                 if let Some(next) = chars.next() {
-                    current_segment.push(next);
+                    current_word.push(WordSegment::SingleQuoted(next.to_string()));
                 } else {
-                    current_segment.push('\\');
+                    current_word.push(WordSegment::SingleQuoted("\\".to_string()));
                 }
             }
             (State::InWord, c) => {
@@ -142,10 +148,19 @@ pub fn tokenize(input: &str) -> Vec<Word> {
                 words.push(current_word);
             }
         }
-        State::InDoubleQuote | State::InSingleQuote => {
-            // Unclosed quote — flush what we have
+        State::InDoubleQuote => {
+            // Unclosed double quote — preserve quote context
             if !current_segment.is_empty() {
-                current_word.push(WordSegment::Unquoted(current_segment));
+                current_word.push(WordSegment::DoubleQuoted(current_segment));
+            }
+            if !current_word.is_empty() {
+                words.push(current_word);
+            }
+        }
+        State::InSingleQuote => {
+            // Unclosed single quote — preserve quote context (no expansion)
+            if !current_segment.is_empty() {
+                current_word.push(WordSegment::SingleQuoted(current_segment));
             }
             if !current_word.is_empty() {
                 words.push(current_word);
@@ -322,5 +337,58 @@ mod tests {
             WordSegment::DoubleQuoted("llo".into()),
             WordSegment::SingleQuoted("world".into()),
         ]);
+    }
+
+    // ── Escaped metacharacter tests ──
+
+    #[test]
+    fn escaped_dollar_is_literal() {
+        // \$VAR should NOT expand — the $ is escaped
+        let words = tokenize(r"\$HOME");
+        assert_eq!(words.len(), 1);
+        // The $ should be in a SingleQuoted segment (literal)
+        assert!(words[0].iter().any(|seg| matches!(seg, WordSegment::SingleQuoted(s) if s == "$")));
+    }
+
+    #[test]
+    fn escaped_tilde_is_literal() {
+        let words = tokenize(r"\~");
+        assert_eq!(words.len(), 1);
+        assert!(words[0].iter().any(|seg| matches!(seg, WordSegment::SingleQuoted(s) if s == "~")));
+    }
+
+    #[test]
+    fn escaped_glob_is_literal() {
+        let words = tokenize(r"\*.rs");
+        assert_eq!(words.len(), 1);
+        // The * should be SingleQuoted (literal), not Unquoted (expandable)
+        assert!(words[0].iter().any(|seg| matches!(seg, WordSegment::SingleQuoted(s) if s == "*")));
+    }
+
+    #[test]
+    fn escaped_char_mid_word_is_literal() {
+        // echo foo\$BAR should have $ as literal
+        let words = tokenize(r"echo foo\$BAR");
+        assert_eq!(words.len(), 2);
+        let second = &words[1];
+        assert!(second.iter().any(|seg| matches!(seg, WordSegment::SingleQuoted(s) if s == "$")));
+    }
+
+    // ── Unterminated quote tests ──
+
+    #[test]
+    fn unterminated_double_quote_keeps_context() {
+        // Missing closing " — content stays DoubleQuoted
+        let words = tokenize(r#"echo "$HOME"#);
+        assert_eq!(words.len(), 2);
+        assert!(words[1].iter().any(|seg| matches!(seg, WordSegment::DoubleQuoted(_))));
+    }
+
+    #[test]
+    fn unterminated_single_quote_keeps_context() {
+        // Missing closing ' — content stays SingleQuoted (no expansion)
+        let words = tokenize("echo '$HOME");
+        assert_eq!(words.len(), 2);
+        assert!(words[1].iter().any(|seg| matches!(seg, WordSegment::SingleQuoted(s) if s == "$HOME")));
     }
 }
