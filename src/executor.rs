@@ -72,6 +72,13 @@ pub fn execute_pipeline(
         return ExecutionAction::Continue(1);
     }
 
+    // On Unix, the first external child becomes the pipeline's process group
+    // leader; subsequent stages join that group. Stored here so the background
+    // path can register the correct pgid with the job table for later cleanup.
+    // On non-Unix it stays None and the background path falls back to child.id().
+    #[allow(unused_mut)]
+    let mut pipeline_pgid: Option<u32> = None;
+
     let mut children: Vec<std::process::Child> = Vec::new();
     // Non-last builtins run on threads so the pipe has a reader before they write.
     // Dropping a JoinHandle detaches the thread (used in background and error paths).
@@ -210,6 +217,43 @@ pub fn execute_pipeline(
             let mut process = Command::new(&segment.command.program);
             process.args(&segment.command.args);
 
+            // ── Unix: reset shell-inherited signal handlers and join pipeline group ──
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                // Snapshot the current pgid *before* spawning so the closure
+                // captures the right leader pid (None = first stage, creates new group;
+                // Some(pgid) = subsequent stages, join that group).
+                let captured_pgid = pipeline_pgid;
+                unsafe {
+                    process.pre_exec(move || {
+                        // Reset signals the shell ignores back to SIG_DFL.
+                        // SIG_IGN survives exec(), so without this pipeline stages
+                        // would ignore Ctrl-Z, Ctrl-\, and SIGPIPE just like the shell.
+                        let signals = [
+                            libc::SIGINT,
+                            libc::SIGTSTP,
+                            libc::SIGQUIT,
+                            libc::SIGPIPE,
+                        ];
+                        for &sig in &signals {
+                            if libc::signal(sig, libc::SIG_DFL) == libc::SIG_ERR {
+                                return Err(std::io::Error::last_os_error());
+                            }
+                        }
+                        // First stage (captured_pgid == None): setpgid(0,0) creates a
+                        // new group with this child as leader.
+                        // Later stages: setpgid(0, leader_pid) joins that group.
+                        let target_pgid =
+                            captured_pgid.map(|p| p as libc::pid_t).unwrap_or(0);
+                        if libc::setpgid(0, target_pgid) != 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+            }
+
             let (stdin_stdio, here_string) = match stdin.into_stdio() {
                 Ok(result) => result,
                 Err(msg) => {
@@ -249,6 +293,18 @@ pub fn execute_pipeline(
                 }
             };
 
+            // ── Unix: close the setpgid race (parent side) ──
+            // Both the child's pre_exec and this parent call race to setpgid.
+            // Whichever wins, the result is correct; the loser gets EACCES/ESRCH,
+            // both of which are safe to ignore.
+            #[cfg(unix)]
+            if pipeline_pgid.is_none() {
+                let child_pid = child.id() as libc::pid_t;
+                // SAFETY: child_pid is a freshly forked, valid pid.
+                unsafe { libc::setpgid(child_pid, child_pid); }
+                pipeline_pgid = Some(child.id());
+            }
+
             if let Some(text) = here_string {
                 if let Some(mut stdin) = child.stdin.take() {
                     let _ = writeln!(stdin, "{text}");
@@ -272,7 +328,10 @@ pub fn execute_pipeline(
             // about to drop everything else anyway, reordering is irrelevant.
             let last_child = children.swap_remove(last_idx);
             drop(children); // drop remaining (may produce short-lived zombies until SIGCHLD in module 9)
-            let (id, pid) = job_table.add(last_child, command_text.to_string());
+            // Use the pipeline's true process group id so that kill(-pgid, …) in
+            // shutdown cleanup reaches *all* stages, not just the last child.
+            let pgid = pipeline_pgid.unwrap_or_else(|| last_child.id());
+            let (id, pid) = job_table.add_with_pgid(last_child, command_text.to_string(), pgid);
             println!("[{}] {}", id, pid);
         }
         // No external children (all builtins) — nothing to track.
@@ -288,6 +347,57 @@ pub fn execute_pipeline(
     for handle in builtin_threads {
         let _ = handle.join();
     }
+
+    #[cfg(unix)]
+    {
+        if children.is_empty() {
+            return ExecutionAction::Continue(last_status);
+        }
+
+        let fg_pgid = pipeline_pgid.unwrap_or_else(|| children[0].id());
+        let terminal_guard = match job_control::ForegroundTerminalGuard::new(fg_pgid as libc::pid_t) {
+            Ok(guard) => Some(guard),
+            Err(e) => {
+                eprintln!("jsh: failed to move terminal to pipeline job group {}: {e}", fg_pgid);
+                None
+            }
+        };
+
+        let child_pids: Vec<u32> = children.iter().map(|child| child.id()).collect();
+        let last_external_pid = last_external_index.and_then(|idx| children.get(idx).map(|child| child.id()));
+
+        let wait_result = match wait_for_pipeline_process_group(&child_pids, fg_pgid as libc::pid_t, last_external_pid) {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                eprintln!("jsh: failed waiting for pipeline jobs: {e}");
+                drop(terminal_guard);
+                return ExecutionAction::Continue(1);
+            }
+        };
+
+        drop(terminal_guard);
+
+        match wait_result {
+            PipelineWaitOutcome::Stopped => {
+                let stopped_index = last_external_index.unwrap_or(0);
+                let stopped_child = if stopped_index < children.len() {
+                    children.swap_remove(stopped_index)
+                } else {
+                    children.swap_remove(0)
+                };
+                let (id, _) = job_table.add_stopped_with_pgid(stopped_child, command_text.to_string(), fg_pgid);
+                println!("[{}]  Stopped  {}", id, command_text);
+                return ExecutionAction::Continue(0);
+            }
+            PipelineWaitOutcome::Exited(code) => {
+                if last_is_external {
+                    return ExecutionAction::Continue(code);
+                }
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
     for (idx, mut child) in children.into_iter().enumerate() {
         match child.wait() {
             Ok(status) => {
@@ -787,4 +897,62 @@ fn command_error(program: &str, e: &std::io::Error) -> i32 {
         eprintln!("jsh: {program}: {e}");
         126
     }
+}
+
+#[cfg(unix)]
+enum PipelineWaitOutcome {
+    Exited(i32),
+    Stopped,
+}
+
+#[cfg(unix)]
+fn wait_for_pipeline_process_group(
+    child_pids: &[u32],
+    pgid: libc::pid_t,
+    last_external_pid: Option<u32>,
+) -> io::Result<PipelineWaitOutcome> {
+    if child_pids.is_empty() {
+        return Ok(PipelineWaitOutcome::Exited(0));
+    }
+
+    use std::collections::HashSet;
+
+    let mut remaining: HashSet<libc::pid_t> =
+        child_pids.iter().map(|pid| *pid as libc::pid_t).collect();
+    let mut last_exit_code: Option<i32> = None;
+
+    while !remaining.is_empty() {
+        let mut raw_status: libc::c_int = 0;
+        let waited = unsafe { libc::waitpid(-pgid, &mut raw_status, libc::WUNTRACED) };
+
+        if waited < 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(err);
+        }
+
+        if unsafe { libc::WIFSTOPPED(raw_status) } {
+            return Ok(PipelineWaitOutcome::Stopped);
+        }
+
+        if !remaining.remove(&waited) {
+            continue;
+        }
+
+        let code = if unsafe { libc::WIFEXITED(raw_status) } {
+            unsafe { libc::WEXITSTATUS(raw_status) as i32 }
+        } else if unsafe { libc::WIFSIGNALED(raw_status) } {
+            128 + unsafe { libc::WTERMSIG(raw_status) }
+        } else {
+            1
+        };
+
+        if Some(waited as u32) == last_external_pid {
+            last_exit_code = Some(code);
+        }
+    }
+
+    Ok(PipelineWaitOutcome::Exited(last_exit_code.unwrap_or(0)))
 }
