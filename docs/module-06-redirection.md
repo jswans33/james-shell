@@ -845,6 +845,12 @@ jsh> echo secret > /dev/null
 jsh>
 ```
 
+### Behavior Notes
+- Redirections are processed left-to-right (`2>&1` vs `> file` order matters).
+- `<<<` writes the text plus a trailing newline to stdin.
+- If a redirect target expands to multiple words, it is treated as an error.
+- Builtins now accept stdin redirection (`<`, `<<<`) even if they ignore input.
+
 On Windows, the same commands work. `/dev/null` is transparently mapped to `NUL`. File paths use the native separator. The `Stdio` API handles all platform differences behind the scenes.
 
 ---

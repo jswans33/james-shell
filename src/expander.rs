@@ -12,6 +12,8 @@ pub fn expand_words(words: &[Word], last_exit_code: i32) -> Vec<String> {
 
 /// Expand a single word (which may have mixed quoting) into one or more strings.
 fn expand_word(segments: &[WordSegment], last_exit_code: i32) -> Vec<String> {
+    // Track whether the accumulated text contains glob characters that originated
+    // from unquoted segments. Mixed-quote globs should not expand.
     let mut partials: Vec<(String, bool)> = vec![(String::new(), false)];
 
     for segment in segments {
@@ -33,7 +35,13 @@ fn expand_word(segments: &[WordSegment], last_exit_code: i32) -> Vec<String> {
                     vec![expanded]
                 };
 
-                split_fields.into_iter().map(|field| (field, true)).collect()
+                split_fields
+                    .into_iter()
+                    .map(|field| {
+                        let has_glob = contains_glob_chars(&field);
+                        (field, has_glob)
+                    })
+                    .collect()
             }
         };
 
@@ -351,5 +359,28 @@ mod tests {
         let result = expand_word(&word, 0);
         assert_eq!(result, vec!["alpha beta"]);
         unsafe { std::env::remove_var("JSH_SPLIT_TEST") };
+    }
+
+    #[test]
+    fn mixed_quoted_glob_does_not_expand() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "jsh_glob_test_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        std::fs::write(temp_dir.join("pre_match.rs"), "test").unwrap();
+
+        let original = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&temp_dir).unwrap();
+
+        let word = vec![
+            WordSegment::Unquoted("pre".into()),
+            WordSegment::DoubleQuoted("*.rs".into()),
+        ];
+        let result = expand_word(&word, 0);
+        assert_eq!(result, vec!["pre*.rs"]);
+
+        std::env::set_current_dir(original).unwrap();
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

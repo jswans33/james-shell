@@ -172,6 +172,11 @@ jsh> [Ctrl-D or Ctrl-Z+Enter]
 Goodbye!
 ```
 
+### Behavior Notes
+- Prompt is `jsh> ` on every loop.
+- `Ctrl-C` prints a newline and re-displays the prompt (no exit).
+- EOF exits the shell (`Ctrl-D` on Unix, `Ctrl-Z` then Enter on Windows).
+
 ---
 
 ## What's next?

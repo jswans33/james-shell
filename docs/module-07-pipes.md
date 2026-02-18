@@ -662,6 +662,12 @@ jsh> echo $?
 0
 ```
 
+### Behavior Notes
+- Builtins can participate in pipelines; their stdout can feed the next command.
+- `2>&1` respects the pipeline when stdout is piped.
+- Redirecting stdout on a non-terminal pipeline command is rejected.
+- Pipeline exit status is the last command's exit code.
+
 Notice the last example: `cat` fails, but the pipeline exit code is 0 because `head` (the last command) succeeded. This is standard shell behavior.
 
 On Windows, the same pipeline syntax works. Programs like `findstr` serve as the Windows equivalent of `grep`, but many users install Unix-style tools (via Git Bash, MSYS2, or Windows Subsystem for Linux). Our shell does not care which programs are used -- it just connects their I/O.

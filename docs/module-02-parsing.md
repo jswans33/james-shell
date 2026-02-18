@@ -180,6 +180,12 @@ jsh>
 jsh> [empty input is ignored]
 ```
 
+### Behavior Notes
+- Quotes are preserved for expansion (`'...'` is literal, `\"...\"` allows `$` expansion).
+- Backslash escapes a single character in unquoted text.
+- `|` is a pipeline separator only when unquoted; `||` is treated as a syntax error.
+- Redirection operators (`>`, `>>`, `<`, `<<<`, `2>`, `2>&1`) are tokens only when unquoted.
+
 ---
 
 ## What's next?

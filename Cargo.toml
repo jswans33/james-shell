@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 ctrlc = "3"  # Cross-platform Ctrl-C (SIGINT) handling
 glob = "0.3"  # Wildcard/pathname expansion
+os_pipe = "1" # Cross-platform OS pipes for pipeline plumbing

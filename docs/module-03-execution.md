@@ -178,6 +178,11 @@ jsh> exit
 
 (Note: `exit` won't work yet — that's a builtin, Module 4!)
 
+### Behavior Notes
+- External commands run via `std::process::Command`.
+- `command not found` exits with code `127`; other spawn errors use `126`.
+- Exit status is captured and used for `$?` in later modules.
+
 ---
 
 ## What's next?

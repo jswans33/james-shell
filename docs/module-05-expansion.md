@@ -680,6 +680,12 @@ jsh> echo $UNDEFINED
 jsh>
 ```
 
+### Behavior Notes
+- Tilde expansion only applies to `~`, `~/`, or `~\\` (no `~user` support yet).
+- Glob expansion only triggers when glob characters come from unquoted text.
+- Word splitting happens only for unquoted expansions; quoted expansions stay as one arg.
+- `$?`, `$$`, and `$0` are supported and update on each command.
+
 On Windows, the behavior is identical except that `~` expands to `C:\Users\jswan` (or wherever `USERPROFILE` points) and glob patterns use backslash-style paths.
 
 ---

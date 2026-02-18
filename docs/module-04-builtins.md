@@ -246,6 +246,12 @@ jsh> exit
 $                    ← back to your real shell
 ```
 
+### Behavior Notes
+- Builtins are checked first and shadow external commands with the same name.
+- `cd -` uses `OLDPWD` and prints an error if it is unset.
+- `export` currently supports `VAR=value` only; `export VAR` is a no-op with a usage message.
+- `type` searches `PATH` (and `PATHEXT` on Windows) for external commands.
+
 ---
 
 ## What's next?

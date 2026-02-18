@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 /// The list of all builtin command names.
@@ -20,6 +20,7 @@ pub fn is_builtin(name: &str) -> bool {
 pub fn execute(
     program: &str,
     args: &[String],
+    _stdin: &mut dyn Read,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> BuiltinAction {

@@ -1,5 +1,6 @@
+use os_pipe::{pipe, PipeReader, PipeWriter};
 use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Cursor, Read, Write};
 use std::process::{Command, Stdio};
 
 use crate::builtins;
@@ -24,21 +25,6 @@ fn exit_code(status: std::process::ExitStatus) -> i32 {
 
     1
 }
-
-/// Track what a file descriptor has been set to, so we can duplicate it
-/// when processing 2>&1 or 1>&2 redirections.
-#[derive(Clone)]
-enum StdioTarget {
-    /// Inherited from the shell (default)
-    Inherit,
-    /// Discarded via /dev/null or NUL
-    Null,
-    /// Redirected to a file (path, append)
-    FilePath(String, bool),
-}
-
-/// A pair of writers for stdout and stderr.
-type WriterPair = (Box<dyn Write>, Box<dyn Write>);
 
 #[derive(Debug)]
 pub struct PipelineCommand {
@@ -72,17 +58,13 @@ pub fn execute_pipeline(commands: Vec<PipelineCommand>) -> ExecutionAction {
         return execute(&cmd.command, &cmd.redirections);
     }
 
-    if commands
-        .iter()
-        .any(|cmd| cmd.command.program == "exit")
-    {
+    if commands.iter().any(|cmd| cmd.command.program == "exit") {
         eprintln!("jsh: 'exit' is not supported in pipelines");
         return ExecutionAction::Continue(1);
     }
 
     let mut children: Vec<std::process::Child> = Vec::new();
-    let mut prev_stdout: Option<std::process::ChildStdout> = None;
-    let mut pending_builtin: Option<(String, Vec<String>, StdioTarget)> = None;
+    let mut prev_pipe: Option<PipeReader> = None;
     let mut last_status = 0;
     let last_is_external = !builtins::is_builtin(
         &commands
@@ -90,222 +72,161 @@ pub fn execute_pipeline(commands: Vec<PipelineCommand>) -> ExecutionAction {
             .map(|cmd| cmd.command.program.as_str())
             .unwrap_or(""),
     );
+    let mut last_external_index: Option<usize> = None;
 
     for (idx, segment) in commands.iter().enumerate() {
         let is_last = idx + 1 == commands.len();
         let is_builtin = builtins::is_builtin(&segment.command.program);
 
-        if is_builtin {
-            prev_stdout = None;
+        let stdin_default = prev_pipe
+            .take()
+            .map(InputHandle::Pipe)
+            .unwrap_or(InputHandle::Inherit);
 
-            let (stdout_target, stderr_target, stdout_set) =
-                match resolve_builtin_redirections(&segment.redirections) {
-                    Ok(resolved) => resolved,
-                    Err(msg) => {
-                        eprintln!("{msg}");
-                        for mut child in children {
-                            let _ = child.wait();
-                        }
-                        return ExecutionAction::Continue(1);
-                    }
-                };
-
-            if !is_last && stdout_set {
-                eprintln!(
-                    "jsh: cannot redirect stdout of non-terminal pipeline command '{}'",
-                    segment.command.program
-                );
-                for mut child in children {
-                    let _ = child.wait();
-                }
-                return ExecutionAction::Continue(1);
-            }
-
-            let next_is_external = !is_last
-                && !builtins::is_builtin(&commands[idx + 1].command.program);
-
-            if next_is_external {
-                pending_builtin = Some((
-                    segment.command.program.clone(),
-                    segment.command.args.clone(),
-                    stderr_target,
-                ));
-            } else {
-                let mut stdout_writer: Box<dyn Write> = if is_last {
-                    match open_writer(&stdout_target, "stdout") {
-                        Ok(writer) => writer,
-                        Err(msg) => {
-                            eprintln!("{msg}");
-                            for mut child in children {
-                                let _ = child.wait();
-                            }
-                            return ExecutionAction::Continue(1);
-                        }
-                    }
-                } else {
-                    Box::new(io::sink())
-                };
-
-                let mut stderr_writer = match open_writer(&stderr_target, "stderr") {
-                    Ok(writer) => writer,
-                    Err(msg) => {
-                        eprintln!("{msg}");
-                        for mut child in children {
-                            let _ = child.wait();
-                        }
-                        return ExecutionAction::Continue(1);
-                    }
-                };
-
-                let status = match builtins::execute(
-                    &segment.command.program,
-                    &segment.command.args,
-                    stdout_writer.as_mut(),
-                    stderr_writer.as_mut(),
-                ) {
-                    builtins::BuiltinAction::Continue(code)
-                    | builtins::BuiltinAction::Exit(code) => code,
-                };
-
-                if is_last {
-                    last_status = status;
+        let (stdout_default, next_pipe_reader) = if !is_last {
+            match pipe() {
+                Ok((reader, writer)) => (OutputHandle::Pipe(writer), Some(reader)),
+                Err(e) => {
+                    eprintln!("jsh: failed to create pipe: {e}");
+                    wait_children(&mut children);
+                    return ExecutionAction::Continue(1);
                 }
             }
+        } else {
+            (OutputHandle::Inherit, None)
+        };
 
-            continue;
-        }
+        let defaults = RedirectionDefaults {
+            stdin: stdin_default,
+            stdout: stdout_default,
+            stderr: OutputHandle::Inherit,
+        };
 
-        let mut process = Command::new(&segment.command.program);
-        process.args(&segment.command.args);
-
-        if let Some(previous) = prev_stdout.take() {
-            process.stdin(Stdio::from(previous));
-        } else if pending_builtin.is_some() {
-            process.stdin(Stdio::piped());
-        }
-
-        if !is_last {
-            process.stdout(Stdio::piped());
-        }
-
-        let redir_state = match apply_redirections(&mut process, &segment.redirections) {
-            Ok(state) => state,
+        let resolved = match resolve_redirections(&segment.redirections, defaults) {
+            Ok(resolved) => resolved,
             Err(msg) => {
                 eprintln!("{msg}");
-                for mut child in children {
-                    let _ = child.wait();
-                }
+                wait_children(&mut children);
                 return ExecutionAction::Continue(1);
             }
         };
 
-        if redir_state.stdin_set {
-            if let Some((builtin_program, builtin_args, stderr_target)) =
-                pending_builtin.take()
-            {
-                let mut stderr_writer = match open_writer(&stderr_target, "stderr") {
-                    Ok(writer) => writer,
-                    Err(msg) => {
-                        eprintln!("{msg}");
-                        for mut child in children {
-                            let _ = child.wait();
-                        }
-                        return ExecutionAction::Continue(1);
-                    }
-                };
-                let mut stdout_writer: Box<dyn Write> = Box::new(io::sink());
-                let _ = match builtins::execute(
-                    &builtin_program,
-                    &builtin_args,
-                    stdout_writer.as_mut(),
-                    stderr_writer.as_mut(),
-                ) {
-                    builtins::BuiltinAction::Continue(code)
-                    | builtins::BuiltinAction::Exit(code) => code,
-                };
-            }
-        }
+        let ResolvedRedirections {
+            stdin,
+            stdout,
+            stderr,
+            stdout_redirected,
+        } = resolved;
 
-        if !is_last && redir_state.stdout_set {
+        if !is_last && stdout_redirected {
             eprintln!(
                 "jsh: cannot redirect stdout of non-terminal pipeline command '{}'",
                 segment.command.program
             );
-            for mut child in children {
-                let _ = child.wait();
-            }
+            wait_children(&mut children);
             return ExecutionAction::Continue(1);
         }
 
-        let mut child = match process.spawn() {
-            Ok(child) => child,
-            Err(e) => {
-                let code = command_error(&segment.command.program, &e);
-                for mut child in children {
-                    let _ = child.wait();
-                }
-                return ExecutionAction::Continue(code);
-            }
-        };
-
-        if let Some(text) = redir_state.here_string {
-            if let Some(mut stdin) = child.stdin.take() {
-                let _ = writeln!(stdin, "{text}");
-            }
-        }
-
-        if let Some((builtin_program, builtin_args, stderr_target)) = pending_builtin.take() {
-            let stdin = match child.stdin.take() {
-                Some(stdin) => stdin,
-                None => {
-                    eprintln!(
-                        "jsh: failed to pipe builtin output to '{}'",
-                        segment.command.program
-                    );
-                    let _ = child.wait();
-                    for mut child in children {
-                        let _ = child.wait();
-                    }
+        if is_builtin {
+            let mut stdin_reader = match stdin.into_reader() {
+                Ok(reader) => reader,
+                Err(msg) => {
+                    eprintln!("{msg}");
+                    wait_children(&mut children);
                     return ExecutionAction::Continue(1);
                 }
             };
-
-            let mut stderr_writer = match open_writer(&stderr_target, "stderr") {
+            let mut stdout_writer = match stdout.into_writer("stdout") {
                 Ok(writer) => writer,
                 Err(msg) => {
                     eprintln!("{msg}");
-                    let _ = child.wait();
-                    for mut child in children {
-                        let _ = child.wait();
-                    }
+                    wait_children(&mut children);
+                    return ExecutionAction::Continue(1);
+                }
+            };
+            let mut stderr_writer = match stderr.into_writer("stderr") {
+                Ok(writer) => writer,
+                Err(msg) => {
+                    eprintln!("{msg}");
+                    wait_children(&mut children);
                     return ExecutionAction::Continue(1);
                 }
             };
 
-            let mut stdout_writer: Box<dyn Write> = Box::new(stdin);
-            let _ = match builtins::execute(
-                &builtin_program,
-                &builtin_args,
+            let status = match builtins::execute(
+                &segment.command.program,
+                &segment.command.args,
+                stdin_reader.as_mut(),
                 stdout_writer.as_mut(),
                 stderr_writer.as_mut(),
             ) {
                 builtins::BuiltinAction::Continue(code)
                 | builtins::BuiltinAction::Exit(code) => code,
             };
+
+            let _ = stdout_writer.flush();
+            let _ = stderr_writer.flush();
+
+            if is_last {
+                last_status = status;
+            }
+        } else {
+            let mut process = Command::new(&segment.command.program);
+            process.args(&segment.command.args);
+
+            let (stdin_stdio, here_string) = match stdin.into_stdio() {
+                Ok(result) => result,
+                Err(msg) => {
+                    eprintln!("{msg}");
+                    wait_children(&mut children);
+                    return ExecutionAction::Continue(1);
+                }
+            };
+            let stdout_stdio = match stdout.into_stdio() {
+                Ok(stdio) => stdio,
+                Err(msg) => {
+                    eprintln!("{msg}");
+                    wait_children(&mut children);
+                    return ExecutionAction::Continue(1);
+                }
+            };
+            let stderr_stdio = match stderr.into_stdio() {
+                Ok(stdio) => stdio,
+                Err(msg) => {
+                    eprintln!("{msg}");
+                    wait_children(&mut children);
+                    return ExecutionAction::Continue(1);
+                }
+            };
+
+            process.stdin(stdin_stdio).stdout(stdout_stdio).stderr(stderr_stdio);
+
+            let mut child = match process.spawn() {
+                Ok(child) => child,
+                Err(e) => {
+                    let code = command_error(&segment.command.program, &e);
+                    wait_children(&mut children);
+                    return ExecutionAction::Continue(code);
+                }
+            };
+
+            if let Some(text) = here_string {
+                if let Some(mut stdin) = child.stdin.take() {
+                    let _ = writeln!(stdin, "{text}");
+                }
+            }
+
+            children.push(child);
+            last_external_index = Some(children.len() - 1);
         }
 
-        if !is_last {
-            prev_stdout = child.stdout.take();
-        }
-
-        children.push(child);
+        prev_pipe = next_pipe_reader;
     }
 
-    let last_child_index = children.len().saturating_sub(1);
     for (idx, mut child) in children.into_iter().enumerate() {
         match child.wait() {
             Ok(status) => {
-                if last_is_external && idx == last_child_index {
+                if last_is_external && Some(idx) == last_external_index {
                     last_status = exit_code(status);
                 }
             }
@@ -318,89 +239,157 @@ pub fn execute_pipeline(commands: Vec<PipelineCommand>) -> ExecutionAction {
     ExecutionAction::Continue(last_status)
 }
 
-// ── Builtin execution with redirections ──
+// ── Redirection resolution ──
 
-/// Run a builtin command, routing its output through redirect targets.
-fn run_builtin(cmd: &parser::Command, redirections: &[Redirection]) -> ExecutionAction {
-    // Resolve redirections into writers for stdout and stderr
-    let (mut stdout_writer, mut stderr_writer) = match open_builtin_writers(redirections) {
-        Ok(pair) => pair,
-        Err(msg) => {
-            eprintln!("{msg}");
-            return ExecutionAction::Continue(1);
+#[derive(Debug)]
+enum InputHandle {
+    Inherit,
+    Pipe(PipeReader),
+    File(File),
+    HereString(String),
+}
+
+#[derive(Debug)]
+enum OutputHandle {
+    Inherit,
+    Null,
+    File(File),
+    Pipe(PipeWriter),
+}
+
+struct ResolvedRedirections {
+    stdin: InputHandle,
+    stdout: OutputHandle,
+    stderr: OutputHandle,
+    stdout_redirected: bool,
+}
+
+struct RedirectionDefaults {
+    stdin: InputHandle,
+    stdout: OutputHandle,
+    stderr: OutputHandle,
+}
+
+impl OutputHandle {
+    fn try_clone(&self) -> Result<OutputHandle, String> {
+        match self {
+            OutputHandle::Inherit => Ok(OutputHandle::Inherit),
+            OutputHandle::Null => Ok(OutputHandle::Null),
+            OutputHandle::File(file) => file
+                .try_clone()
+                .map(OutputHandle::File)
+                .map_err(|e| format!("jsh: failed to duplicate file: {e}")),
+            OutputHandle::Pipe(writer) => writer
+                .try_clone()
+                .map(OutputHandle::Pipe)
+                .map_err(|e| format!("jsh: failed to duplicate pipe: {e}")),
         }
-    };
+    }
 
-    match builtins::execute(
-        &cmd.program,
-        &cmd.args,
-        stdout_writer.as_mut(),
-        stderr_writer.as_mut(),
-    ) {
-        builtins::BuiltinAction::Continue(code) => ExecutionAction::Continue(code),
-        builtins::BuiltinAction::Exit(code) => ExecutionAction::Exit(code),
+    fn into_stdio(self) -> Result<Stdio, String> {
+        Ok(match self {
+            OutputHandle::Inherit => Stdio::inherit(),
+            OutputHandle::Null => Stdio::null(),
+            OutputHandle::File(file) => Stdio::from(file),
+            OutputHandle::Pipe(writer) => Stdio::from(writer),
+        })
+    }
+
+    fn into_writer(self, label: &str) -> Result<Box<dyn Write>, String> {
+        match self {
+            OutputHandle::Inherit => {
+                if label == "stderr" {
+                    Ok(Box::new(io::stderr()))
+                } else {
+                    Ok(Box::new(io::stdout()))
+                }
+            }
+            OutputHandle::Null => Ok(Box::new(io::sink())),
+            OutputHandle::File(file) => Ok(Box::new(file)),
+            OutputHandle::Pipe(writer) => Ok(Box::new(writer)),
+        }
     }
 }
 
-/// Resolve redirections into boxed writers for builtins.
-/// Processes redirections left-to-right, tracking targets for fd duplication.
-fn open_builtin_writers(
-    redirections: &[Redirection],
-) -> Result<WriterPair, String> {
-    let (stdout_target, stderr_target, _) = resolve_builtin_redirections(redirections)?;
+impl InputHandle {
+    fn into_stdio(self) -> Result<(Stdio, Option<String>), String> {
+        Ok(match self {
+            InputHandle::Inherit => (Stdio::inherit(), None),
+            InputHandle::Pipe(reader) => (Stdio::from(reader), None),
+            InputHandle::File(file) => (Stdio::from(file), None),
+            InputHandle::HereString(text) => (Stdio::piped(), Some(text)),
+        })
+    }
 
-    let stdout_writer: Box<dyn Write> = open_writer(&stdout_target, "stdout")?;
-    let stderr_writer: Box<dyn Write> = open_writer(&stderr_target, "stderr")?;
-
-    Ok((stdout_writer, stderr_writer))
+    fn into_reader(self) -> Result<Box<dyn Read>, String> {
+        match self {
+            InputHandle::Inherit => Ok(Box::new(io::stdin())),
+            InputHandle::Pipe(reader) => Ok(Box::new(reader)),
+            InputHandle::File(file) => Ok(Box::new(file)),
+            InputHandle::HereString(text) => {
+                Ok(Box::new(Cursor::new(format!("{text}\n"))))
+            }
+        }
+    }
 }
 
-
-fn resolve_builtin_redirections(
+fn resolve_redirections(
     redirections: &[Redirection],
-) -> Result<(StdioTarget, StdioTarget, bool), String> {
-    let mut stdout_target = StdioTarget::Inherit;
-    let mut stderr_target = StdioTarget::Inherit;
-    let mut stdout_set = false;
+    defaults: RedirectionDefaults,
+) -> Result<ResolvedRedirections, String> {
+    let mut stdin = defaults.stdin;
+    let mut stdout = defaults.stdout;
+    let mut stderr = defaults.stderr;
+    let mut stdout_redirected = false;
 
     for redir in redirections {
         match (&redir.target, redir.fd) {
+            // ── fd duplicated to itself — no-op ──
             (RedirectTarget::Fd(target), fd) if *target == fd => {}
+
+            // ── stdout > file (truncate) ──
             (RedirectTarget::File(path), 1) => {
-                stdout_target = if is_null_device(path) {
-                    StdioTarget::Null
-                } else {
-                    StdioTarget::FilePath(path.clone(), false)
-                };
-                stdout_set = true;
+                stdout = open_output_file(path, false)?;
+                stdout_redirected = true;
             }
+
+            // ── stdout >> file (append) ──
             (RedirectTarget::FileAppend(path), 1) => {
-                stdout_target = StdioTarget::FilePath(path.clone(), true);
-                stdout_set = true;
+                stdout = open_output_file(path, true)?;
+                stdout_redirected = true;
             }
+
+            // ── stdin < file ──
+            (RedirectTarget::FileRead(path), 0) => {
+                stdin = open_input_file(path)?;
+            }
+
+            // ── stderr 2> file (truncate) ──
             (RedirectTarget::File(path), 2) => {
-                stderr_target = if is_null_device(path) {
-                    StdioTarget::Null
-                } else {
-                    StdioTarget::FilePath(path.clone(), false)
-                };
+                stderr = open_output_file(path, false)?;
             }
+
+            // ── stderr 2>> file (append) ──
             (RedirectTarget::FileAppend(path), 2) => {
-                stderr_target = StdioTarget::FilePath(path.clone(), true);
+                stderr = open_output_file(path, true)?;
             }
+
+            // ── 2>&1: stderr → wherever stdout currently points ──
             (RedirectTarget::Fd(1), 2) => {
-                stderr_target = stdout_target.clone();
+                stderr = stdout.try_clone()?;
             }
+
+            // ── 1>&2: stdout → wherever stderr currently points ──
             (RedirectTarget::Fd(2), 1) => {
-                stdout_target = stderr_target.clone();
-                stdout_set = true;
+                stdout = stderr.try_clone()?;
+                stdout_redirected = true;
             }
-            (RedirectTarget::FileRead(_) | RedirectTarget::HereString(_), 0) => {
-                return Err(format!(
-                    "jsh: unsupported redirection: fd {} -> {:?}",
-                    redir.fd, redir.target
-                ));
+
+            // ── Here string: <<< text ──
+            (RedirectTarget::HereString(text), 0) => {
+                stdin = InputHandle::HereString(text.clone());
             }
+
             _ => {
                 return Err(format!(
                     "jsh: unsupported redirection: fd {} -> {:?}",
@@ -410,58 +399,162 @@ fn resolve_builtin_redirections(
         }
     }
 
-    Ok((stdout_target, stderr_target, stdout_set))
+    Ok(ResolvedRedirections {
+        stdin,
+        stdout,
+        stderr,
+        stdout_redirected,
+    })
 }
 
-/// Open a writer for a given StdioTarget.
-fn open_writer(target: &StdioTarget, label: &str) -> Result<Box<dyn Write>, String> {
-    match target {
-        StdioTarget::Inherit => {
-            if label == "stderr" {
-                Ok(Box::new(io::stderr()))
-            } else {
-                Ok(Box::new(io::stdout()))
-            }
-        }
-        StdioTarget::Null => Ok(Box::new(io::sink())),
-        StdioTarget::FilePath(path, append) => {
-            let file = if *append {
-                OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path)
-            } else {
-                File::create(path)
-            };
-            Ok(Box::new(
-                file.map_err(|e| format!("jsh: {path}: {e}"))?,
-            ))
-        }
+fn open_output_file(path: &str, append: bool) -> Result<OutputHandle, String> {
+    if is_null_device(path) {
+        return Ok(OutputHandle::Null);
     }
+
+    let file = if append {
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+    } else {
+        OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)
+    };
+
+    file.map(OutputHandle::File)
+        .map_err(|e| format!("jsh: {path}: {e}"))
+}
+
+fn open_input_file(path: &str) -> Result<InputHandle, String> {
+    let file = File::open(path)
+        .map_err(|e| format!("jsh: {path}: {e}"))?;
+    Ok(InputHandle::File(file))
+}
+
+fn wait_children(children: &mut Vec<std::process::Child>) {
+    for mut child in children.drain(..) {
+        let _ = child.wait();
+    }
+}
+
+// ── Builtin execution with redirections ──
+
+/// Run a builtin command, routing its output through redirect targets.
+fn run_builtin(cmd: &parser::Command, redirections: &[Redirection]) -> ExecutionAction {
+    let defaults = RedirectionDefaults {
+        stdin: InputHandle::Inherit,
+        stdout: OutputHandle::Inherit,
+        stderr: OutputHandle::Inherit,
+    };
+
+    let resolved = match resolve_redirections(redirections, defaults) {
+        Ok(resolved) => resolved,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExecutionAction::Continue(1);
+        }
+    };
+
+    let ResolvedRedirections { stdin, stdout, stderr, .. } = resolved;
+
+    let mut stdin_reader = match stdin.into_reader() {
+        Ok(reader) => reader,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExecutionAction::Continue(1);
+        }
+    };
+
+    let mut stdout_writer = match stdout.into_writer("stdout") {
+        Ok(writer) => writer,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExecutionAction::Continue(1);
+        }
+    };
+
+    let mut stderr_writer = match stderr.into_writer("stderr") {
+        Ok(writer) => writer,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExecutionAction::Continue(1);
+        }
+    };
+
+    let action = match builtins::execute(
+        &cmd.program,
+        &cmd.args,
+        stdin_reader.as_mut(),
+        stdout_writer.as_mut(),
+        stderr_writer.as_mut(),
+    ) {
+        builtins::BuiltinAction::Continue(code) => ExecutionAction::Continue(code),
+        builtins::BuiltinAction::Exit(code) => ExecutionAction::Exit(code),
+    };
+
+    let _ = stdout_writer.flush();
+    let _ = stderr_writer.flush();
+
+    action
 }
 
 // ── External command execution with redirections ──
 
 /// Spawn an external program with I/O redirections applied.
 fn run_external(cmd: &parser::Command, redirections: &[Redirection]) -> i32 {
-    let mut process = Command::new(&cmd.program);
-    process.args(&cmd.args);
+    let defaults = RedirectionDefaults {
+        stdin: InputHandle::Inherit,
+        stdout: OutputHandle::Inherit,
+        stderr: OutputHandle::Inherit,
+    };
 
-    // Apply all redirections, collecting any here-string text
-    let here_string = match apply_redirections(&mut process, redirections) {
-        Ok(state) => state.here_string,
+    let resolved = match resolve_redirections(redirections, defaults) {
+        Ok(resolved) => resolved,
         Err(msg) => {
             eprintln!("{msg}");
             return 1;
         }
     };
 
+    let ResolvedRedirections { stdin, stdout, stderr, .. } = resolved;
+
+    let mut process = Command::new(&cmd.program);
+    process.args(&cmd.args);
+
+    let (stdin_stdio, here_string) = match stdin.into_stdio() {
+        Ok(result) => result,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return 1;
+        }
+    };
+
+    let stdout_stdio = match stdout.into_stdio() {
+        Ok(stdio) => stdio,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return 1;
+        }
+    };
+
+    let stderr_stdio = match stderr.into_stdio() {
+        Ok(stdio) => stdio,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return 1;
+        }
+    };
+
+    process.stdin(stdin_stdio).stdout(stdout_stdio).stderr(stderr_stdio);
+
     if let Some(text) = here_string {
-        // Here-string: spawn, write to stdin pipe, then wait
         match process.spawn() {
             Ok(mut child) => {
                 if let Some(mut stdin) = child.stdin.take() {
-                    // Write text + newline (bash convention), then drop to send EOF
                     let _ = writeln!(stdin, "{text}");
                 }
                 match child.wait() {
@@ -475,155 +568,11 @@ fn run_external(cmd: &parser::Command, redirections: &[Redirection]) -> i32 {
             Err(e) => command_error(&cmd.program, &e),
         }
     } else {
-        // Normal execution: status() blocks until the child exits
         match process.status() {
             Ok(status) => exit_code(status),
             Err(e) => command_error(&cmd.program, &e),
         }
     }
-}
-
-/// Apply all redirections to a Command, returning any here-string text.
-/// Redirections are processed left-to-right (order matters for 2>&1).
-struct RedirectionState {
-    here_string: Option<String>,
-    stdin_set: bool,
-    stdout_set: bool,
-}
-
-fn apply_redirections(
-    cmd: &mut Command,
-    redirections: &[Redirection],
-) -> Result<RedirectionState, String> {
-    let mut stdout_target = StdioTarget::Inherit;
-    let mut stderr_target = StdioTarget::Inherit;
-    let mut here_string: Option<String> = None;
-    let mut stdin_set = false;
-    let mut stdout_set = false;
-
-    for redir in redirections {
-        match (&redir.target, redir.fd) {
-            // ── fd duplicated to itself — no-op ──
-            (RedirectTarget::Fd(target), fd) if *target == fd => {}
-
-            // ── stdout > file (truncate) ──
-            (RedirectTarget::File(path), 1) => {
-                if is_null_device(path) {
-                    cmd.stdout(Stdio::null());
-                    stdout_target = StdioTarget::Null;
-                } else {
-                    let file = File::create(path)
-                        .map_err(|e| format!("jsh: {path}: {e}"))?;
-                    cmd.stdout(Stdio::from(file));
-                    stdout_target = StdioTarget::FilePath(path.clone(), false);
-                    stdout_set = true;
-                }
-            }
-
-            // ── stdout >> file (append) ──
-            (RedirectTarget::FileAppend(path), 1) => {
-                let file = OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path)
-                    .map_err(|e| format!("jsh: {path}: {e}"))?;
-                cmd.stdout(Stdio::from(file));
-                stdout_target = StdioTarget::FilePath(path.clone(), true);
-                stdout_set = true;
-            }
-
-            // ── stdin < file ──
-            (RedirectTarget::FileRead(path), 0) => {
-                let file = File::open(path)
-                    .map_err(|e| format!("jsh: {path}: {e}"))?;
-                cmd.stdin(Stdio::from(file));
-                stdin_set = true;
-            }
-
-            // ── stderr 2> file (truncate) ──
-            (RedirectTarget::File(path), 2) => {
-                if is_null_device(path) {
-                    cmd.stderr(Stdio::null());
-                    stderr_target = StdioTarget::Null;
-                } else {
-                    let file = File::create(path)
-                        .map_err(|e| format!("jsh: {path}: {e}"))?;
-                    cmd.stderr(Stdio::from(file));
-                    stderr_target = StdioTarget::FilePath(path.clone(), false);
-                }
-            }
-
-            // ── stderr 2>> file (append) ──
-            (RedirectTarget::FileAppend(path), 2) => {
-                let file = OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path)
-                    .map_err(|e| format!("jsh: {path}: {e}"))?;
-                cmd.stderr(Stdio::from(file));
-                stderr_target = StdioTarget::FilePath(path.clone(), true);
-            }
-
-            // ── 2>&1: stderr → wherever stdout currently points ──
-            (RedirectTarget::Fd(1), 2) => {
-                apply_dup(cmd, &stdout_target, 2)?;
-                stderr_target = stdout_target.clone();
-            }
-
-            // ── 1>&2: stdout → wherever stderr currently points ──
-            (RedirectTarget::Fd(2), 1) => {
-                apply_dup(cmd, &stderr_target, 1)?;
-                stdout_target = stderr_target.clone();
-                stdout_set = true;
-            }
-
-            // ── Here string: <<< text ──
-            (RedirectTarget::HereString(text), 0) => {
-                here_string = Some(text.clone());
-                cmd.stdin(Stdio::piped());
-                stdin_set = true;
-            }
-
-            _ => {
-                return Err(format!(
-                    "jsh: unsupported redirection: fd {} -> {:?}",
-                    redir.fd, redir.target
-                ));
-            }
-        }
-    }
-
-    Ok(RedirectionState {
-        here_string,
-        stdin_set,
-        stdout_set,
-    })
-}
-
-/// Duplicate an fd's target onto another fd.
-/// Opens the same file again (two cursors) for the cross-platform approach.
-fn apply_dup(cmd: &mut Command, source: &StdioTarget, dest_fd: i32) -> Result<(), String> {
-    let stdio = match source {
-        StdioTarget::Inherit => Stdio::inherit(),
-        StdioTarget::Null => Stdio::null(),
-        StdioTarget::FilePath(path, append) => {
-            let file = if *append {
-                OpenOptions::new().create(true).append(true).open(path)
-            } else {
-                OpenOptions::new().create(true).write(true).truncate(false).open(path)
-            };
-            Stdio::from(file.map_err(|e| format!("jsh: {path}: {e}"))?)
-        }
-    };
-
-    match dest_fd {
-        0 => cmd.stdin(stdio),
-        1 => cmd.stdout(stdio),
-        2 => cmd.stderr(stdio),
-        _ => return Err(format!("jsh: unsupported fd: {dest_fd}")),
-    };
-
-    Ok(())
 }
 
 /// Map a spawn/exec error to the appropriate exit code.
