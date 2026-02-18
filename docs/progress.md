@@ -19,7 +19,7 @@
 | Module | Title | Status | Git Tag |
 |--------|-------|--------|---------|
 | 8 | Job Control | **Done** | v0.8.0 |
-| 9 | Signal Handling | Pending | — |
+| 9 | Signal Handling | **Done** | v0.9.0 |
 | 10 | Line Editing & History | Pending | — |
 
 ### Phase 3: Scripting & Hardening (Modules 11–13)

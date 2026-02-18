@@ -1,12 +1,48 @@
 use james_shell::{executor, expander, jobs::JobTable, parser, redirect};
 use std::io::{self, Write};
 
+/// Send SIGHUP (and SIGCONT so stopped jobs can receive it) to every tracked
+/// job's process group when the shell exits.
+/// Errors (e.g. ESRCH for already-exited jobs) are silently ignored —
+/// this is best-effort cleanup and must not disrupt the shell's exit path.
+#[cfg(unix)]
+fn send_sighup_to_jobs(job_table: &james_shell::jobs::JobTable) {
+    for job in job_table.jobs_sorted() {
+        // Skip jobs that have already finished — kill(-pgid, …) would return
+        // ESRCH and is harmless, but filtering avoids unnecessary syscalls.
+        if matches!(job.status, james_shell::jobs::JobStatus::Done(_)) {
+            continue;
+        }
+        // SAFETY: pgid is valid, signals are standard values, return ignored intentionally.
+        unsafe {
+            // Ignore return values: ESRCH means the process group is already gone.
+            libc::kill(-(job.pgid as libc::pid_t), libc::SIGHUP);
+            libc::kill(-(job.pgid as libc::pid_t), libc::SIGCONT);
+        }
+    }
+}
+
 fn main() {
     ctrlc::set_handler(|| {
         println!();
         let _ = io::stdout().flush();
     })
     .expect("Failed to set Ctrl-C handler");
+
+    #[cfg(unix)]
+    // SAFETY: called once, single-threaded, before spawning any children.
+    unsafe {
+        // Shell must survive Ctrl-Z, Ctrl-\, and broken pipes at the prompt.
+        // SIGINT is already handled by the ctrlc crate above (prints newline, EINTR).
+        //
+        // IMPORTANT: SIG_IGN is inherited by forked children AND survives exec().
+        // That means every child spawned after this point would also ignore these
+        // signals — which is wrong. The pre_exec block in executor.rs explicitly
+        // resets them back to SIG_DFL before exec() to restore correct child behavior.
+        libc::signal(libc::SIGTSTP, libc::SIG_IGN);
+        libc::signal(libc::SIGQUIT, libc::SIG_IGN);
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
 
     let stdin = io::stdin();
     let mut stdout = io::stdout();
@@ -143,6 +179,9 @@ fn main() {
             }
         }
     }
+
+    #[cfg(unix)]
+    send_sighup_to_jobs(&job_table);
 
     std::process::exit(last_exit_code);
 }

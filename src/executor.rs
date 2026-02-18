@@ -612,6 +612,22 @@ fn run_external(
         // terminal job-control signals (Ctrl-C / Ctrl-Z) can target it safely.
         unsafe {
             process.pre_exec(|| {
+                // Reset signals the shell ignores back to default before exec.
+                // SIG_IGN survives exec(), so without this reset children would
+                // also ignore Ctrl-Z, Ctrl-\, and SIGPIPE.
+                // SIGINT is included for clarity: exec() clears custom handlers
+                // automatically, but being explicit is better than implicit.
+                let signals = [
+                    libc::SIGINT,
+                    libc::SIGTSTP,
+                    libc::SIGQUIT,
+                    libc::SIGPIPE,
+                ];
+                for &sig in &signals {
+                    if libc::signal(sig, libc::SIG_DFL) == libc::SIG_ERR {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
                 if libc::setpgid(0, 0) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
