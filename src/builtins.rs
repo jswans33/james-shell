@@ -8,7 +8,7 @@ use crate::status;
 
 /// The list of all builtin command names.
 const BUILTINS: &[&str] = &[
-    "cd", "pwd", "exit", "echo", "export", "unset", "type", "jobs", "fg", "bg", "wait",
+    "cd", "pwd", "exit", "echo", "export", "unset", "type", "jobs", "fg", "bg", "wait", "help",
 ];
 
 #[derive(Debug)]
@@ -44,6 +44,7 @@ pub fn execute(
         "fg" => BuiltinAction::Continue(builtin_fg(args, job_table, stdout, stderr)),
         "bg" => BuiltinAction::Continue(builtin_bg(args, job_table, stdout, stderr)),
         "wait" => BuiltinAction::Continue(builtin_wait(args, job_table, stdout, stderr)),
+        "help" => BuiltinAction::Continue(builtin_help(args, stdout, stderr)),
         _ => {
             let _ = writeln!(stderr, "jsh: unknown builtin: {program}");
             BuiltinAction::Continue(1)
@@ -157,6 +158,183 @@ fn builtin_type(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write)
         }
     }
     exit_code
+}
+
+fn builtin_help(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write) -> i32 {
+    match args.first().map(String::as_str) {
+        // ── no args: overview ────────────────────────────────────────────────
+        None => {
+            let _ = writeln!(stdout, "jsh — James Shell  (type 'help <topic>' for details)");
+            let _ = writeln!(stdout, "");
+            let _ = writeln!(stdout, "Builtins:");
+            let _ = writeln!(stdout, "  cd [dir|-]          Change directory (- goes to previous)");
+            let _ = writeln!(stdout, "  pwd                 Print working directory");
+            let _ = writeln!(stdout, "  echo [args...]      Print arguments");
+            let _ = writeln!(stdout, "  export VAR=value    Set and export environment variable");
+            let _ = writeln!(stdout, "  unset VAR           Remove environment variable");
+            let _ = writeln!(stdout, "  type name...        Show whether name is builtin or external");
+            let _ = writeln!(stdout, "  exit [code]         Exit the shell");
+            let _ = writeln!(stdout, "  jobs                List background jobs");
+            let _ = writeln!(stdout, "  fg [%N]             Bring job to foreground");
+            let _ = writeln!(stdout, "  bg [%N]             Resume stopped job in background");
+            let _ = writeln!(stdout, "  wait [%N]           Wait for background job(s)");
+            let _ = writeln!(stdout, "  help [topic]        Show this help or a topic reference");
+            let _ = writeln!(stdout, "");
+            let _ = writeln!(stdout, "Topics: variables  redirection  jobs  expansion  quotes  exit-codes");
+            0
+        }
+
+        // ── builtin-specific usage ────────────────────────────────────────────
+        Some("cd") => {
+            let _ = writeln!(stdout, "cd [dir|-]");
+            let _ = writeln!(stdout, "  Change the current directory.");
+            let _ = writeln!(stdout, "  No argument: go to $HOME.");
+            let _ = writeln!(stdout, "  '-': go to the previous directory ($OLDPWD).");
+            let _ = writeln!(stdout, "  Sets $OLDPWD to the directory you came from.");
+            0
+        }
+        Some("pwd") => {
+            let _ = writeln!(stdout, "pwd");
+            let _ = writeln!(stdout, "  Print the absolute path of the current directory.");
+            0
+        }
+        Some("echo") => {
+            let _ = writeln!(stdout, "echo [args...]");
+            let _ = writeln!(stdout, "  Print arguments separated by spaces, followed by a newline.");
+            0
+        }
+        Some("export") => {
+            let _ = writeln!(stdout, "export VAR=value");
+            let _ = writeln!(stdout, "  Set VAR to value and export it to child processes.");
+            0
+        }
+        Some("unset") => {
+            let _ = writeln!(stdout, "unset VAR...");
+            let _ = writeln!(stdout, "  Remove one or more environment variables.");
+            0
+        }
+        Some("type") => {
+            let _ = writeln!(stdout, "type name...");
+            let _ = writeln!(stdout, "  For each name, report whether it is a shell builtin");
+            let _ = writeln!(stdout, "  or the full path of the external executable.");
+            let _ = writeln!(stdout, "  Exit code 1 if any name is not found.");
+            0
+        }
+        Some("exit") => {
+            let _ = writeln!(stdout, "exit [code]");
+            let _ = writeln!(stdout, "  Exit the shell with the given numeric exit code.");
+            let _ = writeln!(stdout, "  No argument: exit 0.  Non-numeric argument: exit 2.");
+            0
+        }
+        Some("help") => {
+            let _ = writeln!(stdout, "help [topic|builtin]");
+            let _ = writeln!(stdout, "  No argument: list all builtins and topics.");
+            let _ = writeln!(stdout, "  Builtin name: show usage for that builtin.");
+            let _ = writeln!(stdout, "  Topic name: show a reference section.");
+            let _ = writeln!(stdout, "  Topics: variables  redirection  jobs  expansion  quotes  exit-codes");
+            0
+        }
+
+        // ── topics ────────────────────────────────────────────────────────────
+        // Note: "jobs" covers both the builtin and the job-control topic in one arm
+        // to avoid an unreachable-pattern compiler error.
+        Some("jobs") => {
+            let _ = writeln!(stdout, "jobs");
+            let _ = writeln!(stdout, "  List background and stopped jobs with their IDs.");
+            let _ = writeln!(stdout, "  Status column: Running | Stopped | Done");
+            let _ = writeln!(stdout, "");
+            let _ = writeln!(stdout, "Job control summary:");
+            let _ = writeln!(stdout, "  cmd &           Run command in background");
+            let _ = writeln!(stdout, "  fg [%N]         Bring job to foreground");
+            let _ = writeln!(stdout, "  bg [%N]         Resume stopped job in background");
+            let _ = writeln!(stdout, "  wait [%N]       Wait for job(s) to finish");
+            let _ = writeln!(stdout, "  Ctrl-Z          Suspend foreground job (Unix only)");
+            0
+        }
+        Some("fg") => {
+            let _ = writeln!(stdout, "fg [%N]");
+            let _ = writeln!(stdout, "  Bring job %N to the foreground and wait for it.");
+            let _ = writeln!(stdout, "  No argument: use the most recently backgrounded job.");
+            0
+        }
+        Some("bg") => {
+            let _ = writeln!(stdout, "bg [%N]");
+            let _ = writeln!(stdout, "  Resume stopped job %N in the background.");
+            let _ = writeln!(stdout, "  No argument: use the most recently stopped job.");
+            0
+        }
+        Some("wait") => {
+            let _ = writeln!(stdout, "wait [%N]");
+            let _ = writeln!(stdout, "  Wait for background job %N to finish.");
+            let _ = writeln!(stdout, "  No argument: wait for all background jobs.");
+            let _ = writeln!(stdout, "  Sets $? to the exit code of the waited job.");
+            0
+        }
+        Some("variables") => {
+            let _ = writeln!(stdout, "Special variables:");
+            let _ = writeln!(stdout, "  $?        Exit code of the last command");
+            let _ = writeln!(stdout, "  $$        PID of the shell process");
+            let _ = writeln!(stdout, "  $0        Shell name (always 'jsh')");
+            let _ = writeln!(stdout, "  $HOME     Home directory");
+            let _ = writeln!(stdout, "  $PATH     Command search path");
+            let _ = writeln!(stdout, "  $PWD      Current directory");
+            let _ = writeln!(stdout, "  $OLDPWD   Previous directory (set by cd)");
+            let _ = writeln!(stdout, "  $USER     Current user name");
+            let _ = writeln!(stdout, "  $VAR      Value of any exported environment variable");
+            let _ = writeln!(stdout, "  ${{VAR}}    Same as $VAR (brace form)");
+            0
+        }
+        Some("redirection") => {
+            let _ = writeln!(stdout, "Redirection operators:");
+            let _ = writeln!(stdout, "  cmd > file      Write stdout to file (truncate)");
+            let _ = writeln!(stdout, "  cmd >> file     Append stdout to file");
+            let _ = writeln!(stdout, "  cmd < file      Read stdin from file");
+            let _ = writeln!(stdout, "  cmd 2> file     Write stderr to file");
+            let _ = writeln!(stdout, "  cmd 2>> file    Append stderr to file");
+            let _ = writeln!(stdout, "  cmd 2>&1        Merge stderr into stdout");
+            let _ = writeln!(stdout, "  cmd 1>&2        Merge stdout into stderr");
+            let _ = writeln!(stdout, "  cmd <<< word    Feed word as stdin (here-string)");
+            0
+        }
+        Some("expansion") => {
+            let _ = writeln!(stdout, "Word expansion (applied in order):");
+            let _ = writeln!(stdout, "  ~               Expands to $HOME");
+            let _ = writeln!(stdout, "  ~/path          Expands to $HOME/path");
+            let _ = writeln!(stdout, "  $VAR            Variable substitution");
+            let _ = writeln!(stdout, "  ${{VAR}}          Braced variable substitution");
+            let _ = writeln!(stdout, "  *               Matches any string of characters");
+            let _ = writeln!(stdout, "  ?               Matches any single character");
+            let _ = writeln!(stdout, "  [abc]           Matches any character in the set");
+            let _ = writeln!(stdout, "  Globs that match nothing are kept as literals.");
+            let _ = writeln!(stdout, "  Globs inside quotes are not expanded.");
+            0
+        }
+        Some("quotes") => {
+            let _ = writeln!(stdout, "Quoting:");
+            let _ = writeln!(stdout, "  'text'    Single quotes: no expansion of any kind");
+            let _ = writeln!(stdout, "  \"text\"    Double quotes: $VAR expanded, globs suppressed");
+            let _ = writeln!(stdout, "  \\c        Backslash: treat next character literally");
+            let _ = writeln!(stdout, "  Mixing quote styles in one word is allowed.");
+            0
+        }
+        Some("exit-codes") => {
+            let _ = writeln!(stdout, "Exit codes:");
+            let _ = writeln!(stdout, "  0          Success");
+            let _ = writeln!(stdout, "  1          General error");
+            let _ = writeln!(stdout, "  2          Bad usage (wrong arguments)");
+            let _ = writeln!(stdout, "  126        Command found but not executable");
+            let _ = writeln!(stdout, "  127        Command not found");
+            let _ = writeln!(stdout, "  128+N      Command killed by signal N");
+            let _ = writeln!(stdout, "  $?         Holds the exit code of the last command");
+            0
+        }
+
+        // ── unknown ───────────────────────────────────────────────────────────
+        Some(unknown) => {
+            let _ = writeln!(stderr, "help: no help for '{unknown}'");
+            1
+        }
+    }
 }
 
 // ── Job control builtins ──

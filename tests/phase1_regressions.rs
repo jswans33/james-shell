@@ -119,3 +119,41 @@ fn external_stderr_pipes_into_next_command_windows() {
     assert!(stdout.contains("err"), "stdout was: {stdout}");
     assert!(!stderr.contains("err"), "stderr was: {stderr}");
 }
+
+#[test]
+fn help_no_args_lists_builtins() {
+    let output = run_shell(&["help"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("cd"), "stdout was: {stdout}");
+    assert!(stdout.contains("echo"), "stdout was: {stdout}");
+    assert!(stdout.contains("exit"), "stdout was: {stdout}");
+    assert!(stdout.contains("Topics:"), "stdout was: {stdout}");
+    assert!(output.status.success(), "exit code was not 0");
+}
+
+#[test]
+fn help_builtin_name_shows_usage() {
+    let output = run_shell(&["help cd"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("cd"), "stdout was: {stdout}");
+    assert!(stdout.contains("OLDPWD"), "stdout was: {stdout}");
+    assert!(output.status.success(), "exit code was not 0");
+}
+
+#[test]
+fn help_topic_shows_section() {
+    let output = run_shell(&["help redirection"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("2>&1"), "stdout was: {stdout}");
+    assert!(stdout.contains("<<<"), "stdout was: {stdout}");
+    assert!(output.status.success(), "exit code was not 0");
+}
+
+#[test]
+fn help_unknown_topic_exits_nonzero() {
+    let output = run_shell(&["help nonexistent_topic_xyzzy", "echo AFTER:$?"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stdout.contains("AFTER:1"), "stdout was: {stdout}");
+    assert!(stderr.contains("nonexistent_topic_xyzzy"), "stderr was: {stderr}");
+}
