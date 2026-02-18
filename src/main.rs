@@ -1,4 +1,4 @@
-use james_shell::{executor, expander, parser, redirect};
+use james_shell::{executor, expander, jobs::JobTable, parser, redirect};
 use std::io::{self, Write};
 
 fn main() {
@@ -11,8 +11,14 @@ fn main() {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
     let mut last_exit_code: i32 = 0;
+    let mut job_table = JobTable::new();
 
     loop {
+        // Reap any completed background jobs and print "[N] Done cmd" before
+        // showing the prompt — this is how bash notifies you that a background
+        // job finished.
+        job_table.reap();
+
         print!("jsh> ");
         if stdout.flush().is_err() {
             break;
@@ -31,7 +37,7 @@ fn main() {
                 }
 
                 // Parse into quote-aware words and split pipeline segments.
-                let words = match parser::parse_words(trimmed) {
+                let mut words = match parser::parse_words(trimmed) {
                     Ok(words) => words,
                     Err(msg) => {
                         eprintln!("{msg}");
@@ -39,6 +45,20 @@ fn main() {
                         continue;
                     }
                 };
+
+                // Detect a trailing `&` background operator and strip it.
+                // The command text (for display in `jobs`) is the line without `&`.
+                let background = words
+                    .last()
+                    .map(|w| parser::is_background_word(w))
+                    .unwrap_or(false);
+                if background {
+                    words.pop();
+                }
+                let command_text = trimmed
+                    .trim_end_matches(|c: char| c == '&' || c == ' ')
+                    .to_string();
+
                 let pipeline_words = match parser::split_pipeline(&words) {
                     Ok(words) => words,
                     Err(msg) => {
@@ -72,7 +92,6 @@ fn main() {
                         break;
                     }
 
-                    // Build a Command from expanded args and execute with redirections.
                     let command = parser::Command {
                         program: args[0].clone(),
                         args: args[1..].to_vec(),
@@ -82,7 +101,6 @@ fn main() {
 
                 if had_parse_error || commands.is_empty() {
                     if commands.is_empty() && !had_parse_error && last_exit_code == 0 {
-                        // Should only occur for malformed input we couldn't parse as a segment.
                         last_exit_code = 2;
                     }
                     continue;
@@ -90,9 +108,20 @@ fn main() {
 
                 let action = if commands.len() == 1 {
                     let command = commands.swap_remove(0);
-                    executor::execute(&command.command, &command.redirections)
+                    executor::execute(
+                        &command.command,
+                        &command.redirections,
+                        background,
+                        &mut job_table,
+                        &command_text,
+                    )
                 } else {
-                    executor::execute_pipeline(commands)
+                    executor::execute_pipeline(
+                        commands,
+                        background,
+                        &mut job_table,
+                        &command_text,
+                    )
                 };
 
                 match action {

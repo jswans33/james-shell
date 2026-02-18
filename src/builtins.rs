@@ -1,8 +1,12 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+use crate::jobs::{JobStatus, JobTable};
+
 /// The list of all builtin command names.
-const BUILTINS: &[&str] = &["cd", "pwd", "exit", "echo", "export", "unset", "type"];
+const BUILTINS: &[&str] = &[
+    "cd", "pwd", "exit", "echo", "export", "unset", "type", "jobs", "fg", "bg", "wait",
+];
 
 #[derive(Debug)]
 pub enum BuiltinAction {
@@ -23,6 +27,7 @@ pub fn execute(
     _stdin: &mut dyn Read,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
+    job_table: &mut JobTable,
 ) -> BuiltinAction {
     match program {
         "cd" => BuiltinAction::Continue(builtin_cd(args, stderr)),
@@ -32,6 +37,10 @@ pub fn execute(
         "export" => BuiltinAction::Continue(builtin_export(args, stderr)),
         "unset" => BuiltinAction::Continue(builtin_unset(args)),
         "type" => BuiltinAction::Continue(builtin_type(args, stdout, stderr)),
+        "jobs" => BuiltinAction::Continue(builtin_jobs(job_table, stdout)),
+        "fg" => BuiltinAction::Continue(builtin_fg(args, job_table, stdout, stderr)),
+        "bg" => BuiltinAction::Continue(builtin_bg(args, job_table, stdout, stderr)),
+        "wait" => BuiltinAction::Continue(builtin_wait(args, job_table, stdout, stderr)),
         _ => {
             let _ = writeln!(stderr, "jsh: unknown builtin: {program}");
             BuiltinAction::Continue(1)
@@ -145,6 +154,186 @@ fn builtin_type(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write)
         }
     }
     exit_code
+}
+
+// ── Job control builtins ──
+
+/// List all tracked jobs.
+fn builtin_jobs(job_table: &mut JobTable, stdout: &mut dyn Write) -> i32 {
+    // Reap first so any jobs that just finished show as "Done" if still tracked,
+    // but in practice reap() removes them — so jobs shows only live jobs.
+    job_table.reap();
+
+    for job in job_table.jobs_sorted() {
+        let status_str = match &job.status {
+            JobStatus::Running => "Running   ",
+            JobStatus::Stopped => "Stopped   ",
+            JobStatus::Done(_) => "Done      ",
+        };
+        let _ = writeln!(stdout, "[{}]  {} {}", job.id, status_str, job.command);
+    }
+    0
+}
+
+/// Bring a background or stopped job to the foreground and wait for it.
+fn builtin_fg(
+    args: &[String],
+    job_table: &mut JobTable,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> i32 {
+    let job_id = match resolve_job_id(args.first(), job_table.most_recent_id(), stderr) {
+        Some(id) => id,
+        None => return 1,
+    };
+
+    // Remove the job from the table — it's transitioning to foreground.
+    let mut job = match job_table.remove(job_id) {
+        Some(j) => j,
+        None => {
+            let _ = writeln!(stderr, "fg: {}: no such job", job_id);
+            return 1;
+        }
+    };
+
+    let _ = writeln!(stdout, "{}", job.command);
+
+    // On Unix, a stopped job needs SIGCONT before we can wait for it.
+    #[cfg(unix)]
+    if job.status == JobStatus::Stopped {
+        unsafe {
+            libc::kill(job.pid as libc::pid_t, libc::SIGCONT);
+        }
+    }
+
+    match job.child.wait() {
+        Ok(status) => status.code().unwrap_or(1),
+        Err(e) => {
+            let _ = writeln!(stderr, "fg: error waiting for job: {}", e);
+            1
+        }
+    }
+}
+
+/// Resume a stopped job in the background (Unix only).
+fn builtin_bg(
+    args: &[String],
+    job_table: &mut JobTable,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> i32 {
+    let job_id =
+        match resolve_job_id(args.first(), job_table.most_recent_stopped_id(), stderr) {
+            Some(id) => id,
+            None => return 1,
+        };
+
+    match job_table.get_mut(job_id) {
+        Some(job) => {
+            if job.status != JobStatus::Stopped {
+                let _ = writeln!(stderr, "bg: job {} is not stopped", job_id);
+                return 1;
+            }
+
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(job.pid as libc::pid_t, libc::SIGCONT);
+            }
+
+            job.status = JobStatus::Running;
+            let _ = writeln!(stdout, "[{}]  {} &", job.id, job.command);
+            0
+        }
+        None => {
+            let _ = writeln!(stderr, "bg: {}: no such job", job_id);
+            1
+        }
+    }
+}
+
+/// Block until one or all background jobs finish.
+fn builtin_wait(
+    args: &[String],
+    job_table: &mut JobTable,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> i32 {
+    if args.is_empty() {
+        let ids = job_table.running_ids();
+        for id in ids {
+            wait_for_job(id, job_table, stdout, stderr);
+        }
+    } else {
+        for arg in args {
+            match arg.trim_start_matches('%').parse::<usize>() {
+                Ok(id) => wait_for_job(id, job_table, stdout, stderr),
+                Err(_) => {
+                    let _ = writeln!(stderr, "wait: invalid job id: {}", arg);
+                }
+            }
+        }
+    }
+    0
+}
+
+/// Blocking wait for a single job; removes it from the table when done.
+fn wait_for_job(
+    job_id: usize,
+    job_table: &mut JobTable,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) {
+    let job = match job_table.get_mut(job_id) {
+        Some(j) => j,
+        None => {
+            let _ = writeln!(stderr, "wait: {}: no such job", job_id);
+            return;
+        }
+    };
+
+    if job.status != JobStatus::Running {
+        return;
+    }
+
+    let id = job.id;
+    let cmd = job.command.clone();
+
+    match job.child.wait() {
+        Ok(_status) => {
+            let _ = writeln!(stdout, "[{}]  Done  {}", id, cmd);
+        }
+        Err(e) => {
+            let _ = writeln!(stderr, "wait: error: {}", e);
+        }
+    }
+
+    job_table.remove(job_id);
+}
+
+// ── Helpers ──
+
+/// Parse a job ID from an argument (accepts `%N` or `N`), falling back to
+/// `default` when no argument is given.
+fn resolve_job_id(
+    arg: Option<&String>,
+    default: Option<usize>,
+    stderr: &mut dyn Write,
+) -> Option<usize> {
+    match arg {
+        Some(s) => match s.trim_start_matches('%').parse::<usize>() {
+            Ok(id) => Some(id),
+            Err(_) => {
+                let _ = writeln!(stderr, "invalid job id: {s}");
+                None
+            }
+        },
+        None => {
+            if default.is_none() {
+                let _ = writeln!(stderr, "no current job");
+            }
+            default
+        }
+    }
 }
 
 /// Check if a path points to an executable file.

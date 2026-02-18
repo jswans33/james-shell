@@ -1,6 +1,6 @@
 # james-shell — Progress Tracker
 
-## Current Module: 8 — Job Control
+## Current Module: 9 — Signal Handling
 
 ### Phase 1: Traditional Shell Foundation (Modules 1–7)
 
@@ -18,7 +18,7 @@
 
 | Module | Title | Status | Git Tag |
 |--------|-------|--------|---------|
-| 8 | Job Control | Pending | — |
+| 8 | Job Control | **Done** | v0.8.0 |
 | 9 | Signal Handling | Pending | — |
 | 10 | Line Editing & History | Pending | — |
 

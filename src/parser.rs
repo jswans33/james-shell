@@ -98,6 +98,10 @@ pub fn tokenize(input: &str) -> Result<Vec<Word>, String> {
                 // Pipe operator — treat as a segment separator.
                 words.push(vec![WordSegment::Unquoted("|".to_string())]);
             }
+            (State::Normal, '&') => {
+                // Background operator — emit as a standalone token.
+                words.push(vec![WordSegment::Unquoted("&".to_string())]);
+            }
             (State::Normal, '>' | '<') => {
                 // Redirect operator — emit as its own token
                 let op = consume_redirect_op(ch, &mut chars);
@@ -152,6 +156,17 @@ pub fn tokenize(input: &str) -> Result<Vec<Word>, String> {
                     words.push(std::mem::take(&mut current_word));
                 }
                 words.push(vec![WordSegment::Unquoted("|".to_string())]);
+                state = State::Normal;
+            }
+            (State::InWord, '&') => {
+                // Background operator breaks a word just like pipe does.
+                if !current_segment.is_empty() {
+                    current_word.push(WordSegment::Unquoted(std::mem::take(&mut current_segment)));
+                }
+                if !current_word.is_empty() {
+                    words.push(std::mem::take(&mut current_word));
+                }
+                words.push(vec![WordSegment::Unquoted("&".to_string())]);
                 state = State::Normal;
             }
             (State::InWord, '>' | '<') => {
@@ -311,6 +326,12 @@ pub fn split_pipeline(words: &[Word]) -> Result<Vec<Vec<Word>>, String> {
 fn is_pipe_word(word: &Word) -> bool {
     word.len() == 1
         && matches!(&word[0], WordSegment::Unquoted(token) if token == "|")
+}
+
+/// Returns true if this word is a bare `&` background operator.
+pub fn is_background_word(word: &Word) -> bool {
+    word.len() == 1
+        && matches!(&word[0], WordSegment::Unquoted(token) if token == "&")
 }
 
 #[cfg(test)]

@@ -4,6 +4,7 @@ use std::io::{self, Cursor, Read, Write};
 use std::process::{Command, Stdio};
 
 use crate::builtins;
+use crate::jobs::JobTable;
 use crate::parser;
 use crate::redirect::{is_null_device, Redirection, RedirectTarget};
 
@@ -40,22 +41,34 @@ pub enum ExecutionAction {
 
 /// Execute a parsed command with optional redirections.
 /// Builtins are checked first, then external programs.
-pub fn execute(cmd: &parser::Command, redirections: &[Redirection]) -> ExecutionAction {
+pub fn execute(
+    cmd: &parser::Command,
+    redirections: &[Redirection],
+    background: bool,
+    job_table: &mut JobTable,
+    command_text: &str,
+) -> ExecutionAction {
     if builtins::is_builtin(&cmd.program) {
-        return run_builtin(cmd, redirections);
+        // Builtins always run in the foreground — background flag is ignored.
+        return run_builtin(cmd, redirections, job_table);
     }
 
-    ExecutionAction::Continue(run_external(cmd, redirections))
+    ExecutionAction::Continue(run_external(cmd, redirections, background, job_table, command_text))
 }
 
-pub fn execute_pipeline(commands: Vec<PipelineCommand>) -> ExecutionAction {
+pub fn execute_pipeline(
+    commands: Vec<PipelineCommand>,
+    background: bool,
+    job_table: &mut JobTable,
+    command_text: &str,
+) -> ExecutionAction {
     if commands.is_empty() {
         return ExecutionAction::Continue(0);
     }
 
     if commands.len() == 1 {
         let cmd = &commands[0];
-        return execute(&cmd.command, &cmd.redirections);
+        return execute(&cmd.command, &cmd.redirections, background, job_table, command_text);
     }
 
     if commands.iter().any(|cmd| cmd.command.program == "exit") {
@@ -159,6 +172,7 @@ pub fn execute_pipeline(commands: Vec<PipelineCommand>) -> ExecutionAction {
                 stdin_reader.as_mut(),
                 stdout_writer.as_mut(),
                 stderr_writer.as_mut(),
+                job_table,
             ) {
                 builtins::BuiltinAction::Continue(code)
                 | builtins::BuiltinAction::Exit(code) => code,
@@ -223,6 +237,21 @@ pub fn execute_pipeline(commands: Vec<PipelineCommand>) -> ExecutionAction {
         prev_pipe = next_pipe_reader;
     }
 
+    // ── Background pipeline: hand off the last external child, drop the rest ──
+    if background {
+        if let Some(last_idx) = last_external_index {
+            // `swap_remove` moves the element at `last_idx` out.  Because we're
+            // about to drop everything else anyway, reordering is irrelevant.
+            let last_child = children.swap_remove(last_idx);
+            drop(children); // drop remaining (may produce short-lived zombies until SIGCHLD in module 9)
+            let (id, pid) = job_table.add(last_child, command_text.to_string());
+            println!("[{}] {}", id, pid);
+        }
+        // No external children (all builtins) — nothing to track.
+        return ExecutionAction::Continue(0);
+    }
+
+    // ── Foreground pipeline: wait for all children ──
     for (idx, mut child) in children.into_iter().enumerate() {
         match child.wait() {
             Ok(status) => {
@@ -444,7 +473,11 @@ fn wait_children(children: &mut Vec<std::process::Child>) {
 // ── Builtin execution with redirections ──
 
 /// Run a builtin command, routing its output through redirect targets.
-fn run_builtin(cmd: &parser::Command, redirections: &[Redirection]) -> ExecutionAction {
+fn run_builtin(
+    cmd: &parser::Command,
+    redirections: &[Redirection],
+    job_table: &mut JobTable,
+) -> ExecutionAction {
     let defaults = RedirectionDefaults {
         stdin: InputHandle::Inherit,
         stdout: OutputHandle::Inherit,
@@ -491,6 +524,7 @@ fn run_builtin(cmd: &parser::Command, redirections: &[Redirection]) -> Execution
         stdin_reader.as_mut(),
         stdout_writer.as_mut(),
         stderr_writer.as_mut(),
+        job_table,
     ) {
         builtins::BuiltinAction::Continue(code) => ExecutionAction::Continue(code),
         builtins::BuiltinAction::Exit(code) => ExecutionAction::Exit(code),
@@ -505,7 +539,14 @@ fn run_builtin(cmd: &parser::Command, redirections: &[Redirection]) -> Execution
 // ── External command execution with redirections ──
 
 /// Spawn an external program with I/O redirections applied.
-fn run_external(cmd: &parser::Command, redirections: &[Redirection]) -> i32 {
+/// If `background` is true, the child is handed off to the job table immediately.
+fn run_external(
+    cmd: &parser::Command,
+    redirections: &[Redirection],
+    background: bool,
+    job_table: &mut JobTable,
+    command_text: &str,
+) -> i32 {
     let defaults = RedirectionDefaults {
         stdin: InputHandle::Inherit,
         stdout: OutputHandle::Inherit,
@@ -551,26 +592,98 @@ fn run_external(cmd: &parser::Command, redirections: &[Redirection]) -> i32 {
 
     process.stdin(stdin_stdio).stdout(stdout_stdio).stderr(stderr_stdio);
 
-    if let Some(text) = here_string {
+    // ── Background: spawn and hand off to job table ──
+    if background {
         match process.spawn() {
+            Ok(mut child) => {
+                if let Some(text) = here_string {
+                    if let Some(mut stdin) = child.stdin.take() {
+                        let _ = writeln!(stdin, "{text}");
+                    }
+                }
+                let (id, pid) = job_table.add(child, command_text.to_string());
+                println!("[{}] {}", id, pid);
+                return 0;
+            }
+            Err(e) => return command_error(&cmd.program, &e),
+        }
+    }
+
+    // ── Foreground with here-string: must spawn to feed stdin ──
+    if let Some(text) = here_string {
+        return match process.spawn() {
             Ok(mut child) => {
                 if let Some(mut stdin) = child.stdin.take() {
                     let _ = writeln!(stdin, "{text}");
                 }
-                match child.wait() {
-                    Ok(status) => exit_code(status),
-                    Err(e) => {
-                        eprintln!("jsh: {}: {e}", cmd.program);
-                        1
-                    }
-                }
+                run_foreground(child, &cmd.program, job_table, command_text)
             }
             Err(e) => command_error(&cmd.program, &e),
+        };
+    }
+
+    // ── Foreground without here-string ──
+    match process.spawn() {
+        Ok(child) => run_foreground(child, &cmd.program, job_table, command_text),
+        Err(e) => command_error(&cmd.program, &e),
+    }
+}
+
+/// Wait for a foreground child process to finish or be stopped (Unix: Ctrl-Z).
+///
+/// On Unix we call `waitpid` with `WUNTRACED` so that a SIGTSTP (Ctrl-Z) from
+/// the user causes the wait to return instead of blocking forever. If the child
+/// is stopped, we move it to the job table rather than discarding it.
+///
+/// On Windows (and other non-Unix targets) we simply call `child.wait()`.
+fn run_foreground(
+    mut child: std::process::Child,
+    cmd_name: &str,
+    // These are consumed only in the #[cfg(unix)] path; suppress the
+    // "unused variable" warning that fires on non-Unix builds.
+    #[allow(unused_variables)] job_table: &mut JobTable,
+    #[allow(unused_variables)] command_text: &str,
+) -> i32 {
+    #[cfg(unix)]
+    {
+        let pid = child.id() as libc::pid_t;
+        let mut raw_status: libc::c_int = 0;
+
+        // WUNTRACED: return when the child stops (SIGTSTP), not only when it exits.
+        let wait_result = unsafe { libc::waitpid(pid, &mut raw_status, libc::WUNTRACED) };
+
+        if wait_result < 0 {
+            eprintln!("jsh: {cmd_name}: waitpid failed");
+            return 1;
         }
-    } else {
-        match process.status() {
+
+        if unsafe { libc::WIFSTOPPED(raw_status) } {
+            // Child was stopped by Ctrl-Z (SIGTSTP). Move it to the job table.
+            let (id, _) = job_table.add_stopped(child, command_text.to_string());
+            println!("[{}]  Stopped  {}", id, command_text);
+            return 0;
+        }
+
+        if unsafe { libc::WIFEXITED(raw_status) } {
+            return unsafe { libc::WEXITSTATUS(raw_status) };
+        }
+
+        if unsafe { libc::WIFSIGNALED(raw_status) } {
+            let sig = unsafe { libc::WTERMSIG(raw_status) };
+            return 128 + sig;
+        }
+
+        1
+    }
+
+    #[cfg(not(unix))]
+    {
+        match child.wait() {
             Ok(status) => exit_code(status),
-            Err(e) => command_error(&cmd.program, &e),
+            Err(e) => {
+                eprintln!("jsh: {cmd_name}: {e}");
+                1
+            }
         }
     }
 }
