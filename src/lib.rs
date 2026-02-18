@@ -1,6 +1,8 @@
 pub mod builtins;
 pub mod executor;
 pub mod expander;
+pub mod job_control;
 pub mod jobs;
 pub mod parser;
 pub mod redirect;
+pub mod status;

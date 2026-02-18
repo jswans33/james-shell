@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::process::Child;
 
+use crate::status;
+
 /// The lifecycle state of a tracked job.
 #[derive(Debug, PartialEq)]
 pub enum JobStatus {
@@ -13,6 +15,7 @@ pub enum JobStatus {
 pub struct Job {
     pub id: usize,
     pub pid: u32,
+    pub pgid: u32,
     pub command: String,
     pub status: JobStatus,
     pub child: Child,
@@ -40,6 +43,12 @@ impl JobTable {
 
     /// Add a running background job. Returns `(job_id, pid)`.
     pub fn add(&mut self, child: Child, command: String) -> (usize, u32) {
+        let pgid = child.id();
+        self.add_with_pgid(child, command, pgid)
+    }
+
+    /// Add a running background job with an explicit process-group id.
+    pub fn add_with_pgid(&mut self, child: Child, command: String, pgid: u32) -> (usize, u32) {
         let id = self.next_id;
         let pid = child.id();
         self.jobs.insert(
@@ -47,6 +56,7 @@ impl JobTable {
             Job {
                 id,
                 pid,
+                pgid,
                 command,
                 status: JobStatus::Running,
                 child,
@@ -58,7 +68,18 @@ impl JobTable {
 
     /// Add a job that has already been stopped (e.g. via Ctrl-Z). Returns `(job_id, pid)`.
     pub fn add_stopped(&mut self, child: Child, command: String) -> (usize, u32) {
-        let (id, pid) = self.add(child, command);
+        let pgid = child.id();
+        self.add_stopped_with_pgid(child, command, pgid)
+    }
+
+    /// Add a stopped job with an explicit process-group id.
+    pub fn add_stopped_with_pgid(
+        &mut self,
+        child: Child,
+        command: String,
+        pgid: u32,
+    ) -> (usize, u32) {
+        let (id, pid) = self.add_with_pgid(child, command, pgid);
         if let Some(job) = self.jobs.get_mut(&id) {
             job.status = JobStatus::Stopped;
         }
@@ -76,7 +97,7 @@ impl JobTable {
             }
             match job.child.try_wait() {
                 Ok(Some(status)) => {
-                    let code = status.code().unwrap_or(1);
+                    let code = status::exit_code(status);
                     job.status = JobStatus::Done(code);
                     println!("[{}]  Done  {}", job.id, job.command);
                     done_ids.push(*id);

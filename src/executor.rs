@@ -1,31 +1,15 @@
-use os_pipe::{pipe, PipeReader, PipeWriter};
+use os_pipe::{PipeReader, PipeWriter, pipe};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Cursor, Read, Write};
 use std::process::{Command, Stdio};
 
 use crate::builtins;
+#[cfg(unix)]
+use crate::job_control;
 use crate::jobs::JobTable;
 use crate::parser;
-use crate::redirect::{is_null_device, Redirection, RedirectTarget};
-
-/// Derive an exit code from a process status.
-/// On Unix, if a process is killed by a signal, `status.code()` is None
-/// but we can recover the signal number. The shell convention is 128+signal.
-fn exit_code(status: std::process::ExitStatus) -> i32 {
-    if let Some(code) = status.code() {
-        return code;
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt;
-        if let Some(signal) = status.signal() {
-            return 128 + signal;
-        }
-    }
-
-    1
-}
+use crate::redirect::{RedirectTarget, Redirection, is_null_device};
+use crate::status;
 
 #[derive(Debug)]
 pub struct PipelineCommand {
@@ -53,7 +37,13 @@ pub fn execute(
         return run_builtin(cmd, redirections, job_table);
     }
 
-    ExecutionAction::Continue(run_external(cmd, redirections, background, job_table, command_text))
+    ExecutionAction::Continue(run_external(
+        cmd,
+        redirections,
+        background,
+        job_table,
+        command_text,
+    ))
 }
 
 pub fn execute_pipeline(
@@ -68,7 +58,13 @@ pub fn execute_pipeline(
 
     if commands.len() == 1 {
         let cmd = &commands[0];
-        return execute(&cmd.command, &cmd.redirections, background, job_table, command_text);
+        return execute(
+            &cmd.command,
+            &cmd.redirections,
+            background,
+            job_table,
+            command_text,
+        );
     }
 
     if commands.iter().any(|cmd| cmd.command.program == "exit") {
@@ -239,7 +235,10 @@ pub fn execute_pipeline(
                 }
             };
 
-            process.stdin(stdin_stdio).stdout(stdout_stdio).stderr(stderr_stdio);
+            process
+                .stdin(stdin_stdio)
+                .stdout(stdout_stdio)
+                .stderr(stderr_stdio);
 
             let mut child = match process.spawn() {
                 Ok(child) => child,
@@ -293,7 +292,7 @@ pub fn execute_pipeline(
         match child.wait() {
             Ok(status) => {
                 if last_is_external && Some(idx) == last_external_index {
-                    last_status = exit_code(status);
+                    last_status = status::exit_code(status);
                 }
             }
             Err(_) => {
@@ -392,9 +391,7 @@ impl InputHandle {
             InputHandle::Inherit => Ok(Box::new(io::stdin())),
             InputHandle::Pipe(reader) => Ok(Box::new(reader)),
             InputHandle::File(file) => Ok(Box::new(file)),
-            InputHandle::HereString(text) => {
-                Ok(Box::new(Cursor::new(format!("{text}\n"))))
-            }
+            InputHandle::HereString(text) => Ok(Box::new(Cursor::new(format!("{text}\n")))),
         }
     }
 }
@@ -479,10 +476,7 @@ fn open_output_file(path: &str, append: bool) -> Result<OutputHandle, String> {
     }
 
     let file = if append {
-        OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
+        OpenOptions::new().create(true).append(true).open(path)
     } else {
         OpenOptions::new()
             .create(true)
@@ -496,8 +490,7 @@ fn open_output_file(path: &str, append: bool) -> Result<OutputHandle, String> {
 }
 
 fn open_input_file(path: &str) -> Result<InputHandle, String> {
-    let file = File::open(path)
-        .map_err(|e| format!("jsh: {path}: {e}"))?;
+    let file = File::open(path).map_err(|e| format!("jsh: {path}: {e}"))?;
     Ok(InputHandle::File(file))
 }
 
@@ -529,7 +522,12 @@ fn run_builtin(
         }
     };
 
-    let ResolvedRedirections { stdin, stdout, stderr, .. } = resolved;
+    let ResolvedRedirections {
+        stdin,
+        stdout,
+        stderr,
+        ..
+    } = resolved;
 
     let mut stdin_reader = match stdin.into_reader() {
         Ok(reader) => reader,
@@ -598,10 +596,29 @@ fn run_external(
         }
     };
 
-    let ResolvedRedirections { stdin, stdout, stderr, .. } = resolved;
+    let ResolvedRedirections {
+        stdin,
+        stdout,
+        stderr,
+        ..
+    } = resolved;
 
     let mut process = Command::new(&cmd.program);
     process.args(&cmd.args);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Put the spawned process in its own process group before exec so
+        // terminal job-control signals (Ctrl-C / Ctrl-Z) can target it safely.
+        unsafe {
+            process.pre_exec(|| {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
 
     let (stdin_stdio, here_string) = match stdin.into_stdio() {
         Ok(result) => result,
@@ -627,42 +644,58 @@ fn run_external(
         }
     };
 
-    process.stdin(stdin_stdio).stdout(stdout_stdio).stderr(stderr_stdio);
+    process
+        .stdin(stdin_stdio)
+        .stdout(stdout_stdio)
+        .stderr(stderr_stdio);
 
-    // ── Background: spawn and hand off to job table ──
-    if background {
-        match process.spawn() {
-            Ok(mut child) => {
-                if let Some(text) = here_string {
-                    if let Some(mut stdin) = child.stdin.take() {
-                        let _ = writeln!(stdin, "{text}");
-                    }
-                }
-                let (id, pid) = job_table.add(child, command_text.to_string());
-                println!("[{}] {}", id, pid);
-                return 0;
-            }
-            Err(e) => return command_error(&cmd.program, &e),
+    let mut child = match process.spawn() {
+        Ok(child) => child,
+        Err(e) => return command_error(&cmd.program, &e),
+    };
+
+    if let Some(text) = here_string {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = writeln!(stdin, "{text}");
         }
     }
 
-    // ── Foreground with here-string: must spawn to feed stdin ──
-    if let Some(text) = here_string {
-        return match process.spawn() {
-            Ok(mut child) => {
-                if let Some(mut stdin) = child.stdin.take() {
-                    let _ = writeln!(stdin, "{text}");
-                }
-                run_foreground(child, &cmd.program, job_table, command_text)
+    let pgid = child_process_group(&child, &cmd.program);
+
+    // ── Background: hand off to job table ──
+    if background {
+        let (id, pid) = job_table.add_with_pgid(child, command_text.to_string(), pgid);
+        println!("[{}] {}", id, pid);
+        return 0;
+    }
+
+    run_foreground(child, &cmd.program, pgid, job_table, command_text)
+}
+
+fn child_process_group(
+    child: &std::process::Child,
+    #[allow(unused_variables)] cmd_name: &str,
+) -> u32 {
+    #[cfg(unix)]
+    {
+        let pid = child.id() as libc::pid_t;
+
+        if let Err(e) = job_control::set_process_group(pid, pid) {
+            eprintln!("jsh: {cmd_name}: failed to set process group: {e}");
+        }
+
+        return match job_control::process_group_id(pid) {
+            Ok(pgid) => pgid as u32,
+            Err(e) => {
+                eprintln!("jsh: {cmd_name}: failed to read process group: {e}");
+                child.id()
             }
-            Err(e) => command_error(&cmd.program, &e),
         };
     }
 
-    // ── Foreground without here-string ──
-    match process.spawn() {
-        Ok(child) => run_foreground(child, &cmd.program, job_table, command_text),
-        Err(e) => command_error(&cmd.program, &e),
+    #[cfg(not(unix))]
+    {
+        child.id()
     }
 }
 
@@ -676,6 +709,7 @@ fn run_external(
 fn run_foreground(
     mut child: std::process::Child,
     cmd_name: &str,
+    #[allow(unused_variables)] pgid: u32,
     // These are consumed only in the #[cfg(unix)] path; suppress the
     // "unused variable" warning that fires on non-Unix builds.
     #[allow(unused_variables)] job_table: &mut JobTable,
@@ -684,30 +718,33 @@ fn run_foreground(
     #[cfg(unix)]
     {
         let pid = child.id() as libc::pid_t;
-        let mut raw_status: libc::c_int = 0;
+        let terminal_guard = match job_control::ForegroundTerminalGuard::new(pgid as libc::pid_t) {
+            Ok(guard) => Some(guard),
+            Err(e) => {
+                eprintln!("jsh: {cmd_name}: failed to move terminal to job: {e}");
+                None
+            }
+        };
 
-        // WUNTRACED: return when the child stops (SIGTSTP), not only when it exits.
-        let wait_result = unsafe { libc::waitpid(pid, &mut raw_status, libc::WUNTRACED) };
+        let wait_outcome = match job_control::wait_for_pid(pid) {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                eprintln!("jsh: {cmd_name}: waitpid failed: {e}");
+                return 1;
+            }
+        };
 
-        if wait_result < 0 {
-            eprintln!("jsh: {cmd_name}: waitpid failed");
-            return 1;
-        }
+        drop(terminal_guard);
 
-        if unsafe { libc::WIFSTOPPED(raw_status) } {
+        if let job_control::WaitOutcome::Stopped = wait_outcome {
             // Child was stopped by Ctrl-Z (SIGTSTP). Move it to the job table.
-            let (id, _) = job_table.add_stopped(child, command_text.to_string());
+            let (id, _) = job_table.add_stopped_with_pgid(child, command_text.to_string(), pgid);
             println!("[{}]  Stopped  {}", id, command_text);
             return 0;
         }
 
-        if unsafe { libc::WIFEXITED(raw_status) } {
-            return unsafe { libc::WEXITSTATUS(raw_status) };
-        }
-
-        if unsafe { libc::WIFSIGNALED(raw_status) } {
-            let sig = unsafe { libc::WTERMSIG(raw_status) };
-            return 128 + sig;
+        if let job_control::WaitOutcome::Exited(code) = wait_outcome {
+            return code;
         }
 
         1
@@ -716,7 +753,7 @@ fn run_foreground(
     #[cfg(not(unix))]
     {
         match child.wait() {
-            Ok(status) => exit_code(status),
+            Ok(status) => status::exit_code(status),
             Err(e) => {
                 eprintln!("jsh: {cmd_name}: {e}");
                 1

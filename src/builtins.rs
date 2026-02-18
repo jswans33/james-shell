@@ -1,7 +1,10 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
+use crate::job_control;
 use crate::jobs::{JobStatus, JobTable};
+use crate::status;
 
 /// The list of all builtin command names.
 const BUILTINS: &[&str] = &[
@@ -187,30 +190,86 @@ fn builtin_fg(
         None => return 1,
     };
 
-    // Remove the job from the table — it's transitioning to foreground.
-    let mut job = match job_table.remove(job_id) {
-        Some(j) => j,
+    #[allow(unused_variables)]
+    let (pid, pgid, command) = match job_table.get_mut(job_id) {
+        Some(job) => {
+            // Mark as running while we foreground it.
+            job.status = JobStatus::Running;
+            (job.pid, job.pgid, job.command.clone())
+        }
         None => {
             let _ = writeln!(stderr, "fg: {}: no such job", job_id);
             return 1;
         }
     };
 
-    let _ = writeln!(stdout, "{}", job.command);
+    let _ = writeln!(stdout, "{command}");
 
-    // On Unix, a stopped job needs SIGCONT before we can wait for it.
     #[cfg(unix)]
-    if job.status == JobStatus::Stopped {
-        unsafe {
-            libc::kill(job.pid as libc::pid_t, libc::SIGCONT);
+    {
+        let terminal_guard = match job_control::ForegroundTerminalGuard::new(pgid as libc::pid_t) {
+            Ok(guard) => Some(guard),
+            Err(e) => {
+                let _ = writeln!(
+                    stderr,
+                    "fg: failed to move terminal to job {}: {}",
+                    job_id, e
+                );
+                None
+            }
+        };
+
+        if let Err(e) = job_control::send_continue_to_group(pgid as libc::pid_t) {
+            // If the process has just exited, waitpid below will observe it.
+            if e.raw_os_error() != Some(libc::ESRCH) {
+                let _ = writeln!(stderr, "fg: failed to resume job {}: {}", job_id, e);
+            }
+        }
+
+        let outcome = match job_control::wait_for_pid(pid as libc::pid_t) {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                let _ = writeln!(stderr, "fg: error waiting for job {}: {}", job_id, e);
+                return 1;
+            }
+        };
+
+        drop(terminal_guard);
+
+        match outcome {
+            job_control::WaitOutcome::Stopped => {
+                if let Some(job) = job_table.get_mut(job_id) {
+                    job.status = JobStatus::Stopped;
+                }
+                let _ = writeln!(stdout, "[{}]  Stopped  {}", job_id, command);
+                0
+            }
+            job_control::WaitOutcome::Exited(code) => {
+                job_table.remove(job_id);
+                code
+            }
         }
     }
 
-    match job.child.wait() {
-        Ok(status) => status.code().unwrap_or(1),
-        Err(e) => {
-            let _ = writeln!(stderr, "fg: error waiting for job: {}", e);
-            1
+    #[cfg(not(unix))]
+    {
+        let wait_result = match job_table.get_mut(job_id) {
+            Some(job) => job.child.wait(),
+            None => {
+                let _ = writeln!(stderr, "fg: {}: no such job", job_id);
+                return 1;
+            }
+        };
+
+        match wait_result {
+            Ok(status) => {
+                job_table.remove(job_id);
+                status::exit_code(status)
+            }
+            Err(e) => {
+                let _ = writeln!(stderr, "fg: error waiting for job {}: {}", job_id, e);
+                1
+            }
         }
     }
 }
@@ -222,11 +281,10 @@ fn builtin_bg(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> i32 {
-    let job_id =
-        match resolve_job_id(args.first(), job_table.most_recent_stopped_id(), stderr) {
-            Some(id) => id,
-            None => return 1,
-        };
+    let job_id = match resolve_job_id(args.first(), job_table.most_recent_stopped_id(), stderr) {
+        Some(id) => id,
+        None => return 1,
+    };
 
     match job_table.get_mut(job_id) {
         Some(job) => {
@@ -236,8 +294,9 @@ fn builtin_bg(
             }
 
             #[cfg(unix)]
-            unsafe {
-                libc::kill(job.pid as libc::pid_t, libc::SIGCONT);
+            if let Err(e) = job_control::send_continue_to_group(job.pgid as libc::pid_t) {
+                let _ = writeln!(stderr, "bg: failed to resume job {}: {}", job_id, e);
+                return 1;
             }
 
             job.status = JobStatus::Running;
@@ -258,22 +317,33 @@ fn builtin_wait(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> i32 {
+    let mut last_status = 0;
+    let mut had_error = false;
+
     if args.is_empty() {
         let ids = job_table.running_ids();
         for id in ids {
-            wait_for_job(id, job_table, stdout, stderr);
+            match wait_for_job(id, job_table, stdout, stderr) {
+                Ok(status) => last_status = status,
+                Err(()) => had_error = true,
+            }
         }
     } else {
         for arg in args {
             match arg.trim_start_matches('%').parse::<usize>() {
-                Ok(id) => wait_for_job(id, job_table, stdout, stderr),
+                Ok(id) => match wait_for_job(id, job_table, stdout, stderr) {
+                    Ok(status) => last_status = status,
+                    Err(()) => had_error = true,
+                },
                 Err(_) => {
                     let _ = writeln!(stderr, "wait: invalid job id: {}", arg);
+                    had_error = true;
                 }
             }
         }
     }
-    0
+
+    if had_error { 1 } else { last_status }
 }
 
 /// Blocking wait for a single job; removes it from the table when done.
@@ -282,32 +352,36 @@ fn wait_for_job(
     job_table: &mut JobTable,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
-) {
+) -> Result<i32, ()> {
     let job = match job_table.get_mut(job_id) {
         Some(j) => j,
         None => {
             let _ = writeln!(stderr, "wait: {}: no such job", job_id);
-            return;
+            return Err(());
         }
     };
 
     if job.status != JobStatus::Running {
-        return;
+        return Ok(0);
     }
 
     let id = job.id;
     let cmd = job.command.clone();
 
-    match job.child.wait() {
-        Ok(_status) => {
+    let wait_result = job.child.wait();
+
+    match wait_result {
+        Ok(status) => {
+            let code = status::exit_code(status);
             let _ = writeln!(stdout, "[{}]  Done  {}", id, cmd);
+            job_table.remove(job_id);
+            Ok(code)
         }
         Err(e) => {
             let _ = writeln!(stderr, "wait: error: {}", e);
+            Err(())
         }
     }
-
-    job_table.remove(job_id);
 }
 
 // ── Helpers ──
@@ -365,8 +439,7 @@ fn is_executable(path: &Path) -> bool {
 
 #[cfg(not(unix))]
 fn is_windows_executable_extension(extension: &str) -> bool {
-    let pathext = std::env::var("PATHEXT")
-        .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
     pathext
         .split(';')
         .any(|ext| extension == ext.trim_start_matches('.').to_ascii_lowercase())
@@ -384,8 +457,11 @@ fn find_in_path(cmd: &str) -> Option<PathBuf> {
         }
         // On Windows, also try PATHEXT-configured executable extensions.
         if cfg!(windows) {
-            let exts = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
-            let exts = exts.split(';').map(|ext| ext.trim_start_matches('.').to_ascii_lowercase());
+            let exts =
+                std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+            let exts = exts
+                .split(';')
+                .map(|ext| ext.trim_start_matches('.').to_ascii_lowercase());
             for ext in exts {
                 let with_ext = full_path.with_extension(ext);
                 if is_executable(&with_ext) {
