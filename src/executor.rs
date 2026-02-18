@@ -77,6 +77,9 @@ pub fn execute_pipeline(
     }
 
     let mut children: Vec<std::process::Child> = Vec::new();
+    // Non-last builtins run on threads so the pipe has a reader before they write.
+    // Dropping a JoinHandle detaches the thread (used in background and error paths).
+    let mut builtin_threads: Vec<std::thread::JoinHandle<()>> = Vec::new();
     let mut prev_pipe: Option<PipeReader> = None;
     let mut last_status = 0;
     let last_is_external = !builtins::is_builtin(
@@ -166,23 +169,46 @@ pub fn execute_pipeline(
                 }
             };
 
-            let status = match builtins::execute(
-                &segment.command.program,
-                &segment.command.args,
-                stdin_reader.as_mut(),
-                stdout_writer.as_mut(),
-                stderr_writer.as_mut(),
-                job_table,
-            ) {
-                builtins::BuiltinAction::Continue(code)
-                | builtins::BuiltinAction::Exit(code) => code,
-            };
-
-            let _ = stdout_writer.flush();
-            let _ = stderr_writer.flush();
-
             if is_last {
+                // Last command: run synchronously so we can use the real job_table
+                // and capture the pipeline's final exit status.
+                let status = match builtins::execute(
+                    &segment.command.program,
+                    &segment.command.args,
+                    stdin_reader.as_mut(),
+                    stdout_writer.as_mut(),
+                    stderr_writer.as_mut(),
+                    job_table,
+                ) {
+                    builtins::BuiltinAction::Continue(code)
+                    | builtins::BuiltinAction::Exit(code) => code,
+                };
+                let _ = stdout_writer.flush();
+                let _ = stderr_writer.flush();
                 last_status = status;
+            } else {
+                // Non-last command: the downstream stage hasn't been spawned yet,
+                // so running the builtin synchronously here would deadlock if its
+                // output exceeds the OS pipe buffer. Run it on a thread instead —
+                // this mirrors how external commands are already concurrent processes.
+                // Job-control builtins (jobs/fg/bg/wait) don't make sense mid-pipeline,
+                // so a throwaway local JobTable is acceptable.
+                let program = segment.command.program.clone();
+                let args = segment.command.args.clone();
+                let handle = std::thread::spawn(move || {
+                    let mut local_jt = crate::jobs::JobTable::new();
+                    let _ = builtins::execute(
+                        &program,
+                        &args,
+                        stdin_reader.as_mut(),
+                        stdout_writer.as_mut(),
+                        stderr_writer.as_mut(),
+                        &mut local_jt,
+                    );
+                    let _ = stdout_writer.flush();
+                    let _ = stderr_writer.flush();
+                });
+                builtin_threads.push(handle);
             }
         } else {
             let mut process = Command::new(&segment.command.program);
@@ -237,8 +263,11 @@ pub fn execute_pipeline(
         prev_pipe = next_pipe_reader;
     }
 
-    // ── Background pipeline: hand off the last external child, drop the rest ──
+    // ── Background pipeline: detach builtin threads, hand off last child ──
     if background {
+        // Dropping JoinHandles detaches the threads; they write their data and
+        // close the pipe writers naturally, giving downstream processes EOF.
+        drop(builtin_threads);
         if let Some(last_idx) = last_external_index {
             // `swap_remove` moves the element at `last_idx` out.  Because we're
             // about to drop everything else anyway, reordering is irrelevant.
@@ -251,7 +280,15 @@ pub fn execute_pipeline(
         return ExecutionAction::Continue(0);
     }
 
-    // ── Foreground pipeline: wait for all children ──
+    // ── Foreground pipeline: join builtin threads, then wait for children ──
+    //
+    // Threads must be joined before children are waited on to ensure all pipe
+    // writers are closed (signalling EOF to downstream readers) by the time
+    // we call child.wait().  In practice the children are already reading
+    // concurrently, so threads finish promptly once the pipe buffer drains.
+    for handle in builtin_threads {
+        let _ = handle.join();
+    }
     for (idx, mut child) in children.into_iter().enumerate() {
         match child.wait() {
             Ok(status) => {
@@ -324,7 +361,7 @@ impl OutputHandle {
         })
     }
 
-    fn into_writer(self, label: &str) -> Result<Box<dyn Write>, String> {
+    fn into_writer(self, label: &str) -> Result<Box<dyn Write + Send>, String> {
         match self {
             OutputHandle::Inherit => {
                 if label == "stderr" {
@@ -350,7 +387,7 @@ impl InputHandle {
         })
     }
 
-    fn into_reader(self) -> Result<Box<dyn Read>, String> {
+    fn into_reader(self) -> Result<Box<dyn Read + Send>, String> {
         match self {
             InputHandle::Inherit => Ok(Box::new(io::stdin())),
             InputHandle::Pipe(reader) => Ok(Box::new(reader)),
