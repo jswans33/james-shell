@@ -1,4 +1,5 @@
 pub mod builtins;
+pub mod editor;
 pub mod executor;
 pub mod expander;
 pub mod job_control;

@@ -20,7 +20,7 @@
 |--------|-------|--------|---------|
 | 8 | Job Control | **Done** | v0.8.0 |
 | 9 | Signal Handling | **Done** | v0.9.0 |
-| 10 | Line Editing & History | Pending | — |
+| 10 | Line Editing & History | **Done** | v0.10.0 |
 
 ### Phase 3: Scripting & Hardening (Modules 11–13)
 
