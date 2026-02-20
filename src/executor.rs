@@ -25,6 +25,7 @@ pub enum ExecutionAction {
 
 /// Execute a parsed command with optional redirections.
 /// Builtins are checked first, then external programs.
+/// Builtins do not participate in job-control tracking.
 pub fn execute(
     cmd: &parser::Command,
     redirections: &[Redirection],
@@ -33,7 +34,13 @@ pub fn execute(
     command_text: &str,
 ) -> ExecutionAction {
     if builtins::is_builtin(&cmd.program) {
-        // Builtins always run in the foreground — background flag is ignored.
+        if background {
+            eprintln!(
+                "jsh: builtin '{}' does not support background execution; running in the foreground",
+                cmd.program
+            );
+        }
+
         return run_builtin(cmd, redirections, job_table);
     }
 
@@ -72,6 +79,8 @@ pub fn execute_pipeline(
         return ExecutionAction::Continue(1);
     }
 
+    let mut warned_background_builtin = false;
+
     // On Unix, the first external child becomes the pipeline's process group
     // leader; subsequent stages join that group. Stored here so the background
     // path can register the correct pgid with the job table for later cleanup.
@@ -80,7 +89,8 @@ pub fn execute_pipeline(
     let mut pipeline_pgid: Option<u32> = None;
 
     let mut children: Vec<std::process::Child> = Vec::new();
-    // Non-last builtins run on threads so the pipe has a reader before they write.
+    // Non-last pure builtins run on threads so the pipe has a reader before
+    // they write and cannot block the pipeline.
     // Dropping a JoinHandle detaches the thread (used in background and error paths).
     let mut builtin_threads: Vec<std::thread::JoinHandle<()>> = Vec::new();
     let mut prev_pipe: Option<PipeReader> = None;
@@ -96,6 +106,13 @@ pub fn execute_pipeline(
     for (idx, segment) in commands.iter().enumerate() {
         let is_last = idx + 1 == commands.len();
         let is_builtin = builtins::is_builtin(&segment.command.program);
+        if background && is_builtin && !warned_background_builtin {
+            eprintln!(
+                "jsh: builtin '{}' in pipeline does not support background execution; running in the foreground",
+                segment.command.program
+            );
+            warned_background_builtin = true;
+        }
 
         let stdin_default = prev_pipe
             .take()
@@ -146,6 +163,15 @@ pub fn execute_pipeline(
             return ExecutionAction::Continue(1);
         }
 
+        if is_builtin && !is_last && !is_pipeline_compatible_builtin(&segment.command.program) {
+            eprintln!(
+                "jsh: builtin '{}' is not supported in non-terminal pipeline positions",
+                segment.command.program
+            );
+            wait_children(&mut children);
+            return ExecutionAction::Continue(1);
+        }
+
         if is_builtin {
             let mut stdin_reader = match stdin.into_reader() {
                 Ok(reader) => reader,
@@ -190,12 +216,9 @@ pub fn execute_pipeline(
                 let _ = stderr_writer.flush();
                 last_status = status;
             } else {
-                // Non-last command: the downstream stage hasn't been spawned yet,
-                // so running the builtin synchronously here would deadlock if its
-                // output exceeds the OS pipe buffer. Run it on a thread instead —
-                // this mirrors how external commands are already concurrent processes.
-                // Job-control builtins (jobs/fg/bg/wait) don't make sense mid-pipeline,
-                // so a throwaway local JobTable is acceptable.
+            // Pure builtins are executed in parallel with downstream stages.
+            // Side-effecting builtins are rejected in this position by the
+            // compatibility check above to avoid mutating shared shell state.
                 let program = segment.command.program.clone();
                 let args = segment.command.args.clone();
                 let handle = std::thread::spawn(move || {
@@ -412,6 +435,10 @@ pub fn execute_pipeline(
     }
 
     ExecutionAction::Continue(last_status)
+}
+
+fn is_pipeline_compatible_builtin(name: &str) -> bool {
+    matches!(name, "echo" | "pwd" | "type" | "help")
 }
 
 // ── Redirection resolution ──

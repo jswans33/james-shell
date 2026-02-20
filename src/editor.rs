@@ -98,7 +98,11 @@ impl LineEditor {
     /// the method falls back to a plain `read_line()` call so tests work
     /// without modification.
     pub fn read_line(&mut self, prompt: &str) -> io::Result<Option<String>> {
-        if !io::stdout().is_tty() {
+        // Gate on stdin, not stdout: interactive editing requires a keyboard on
+        // the *input* side. `printf 'cmd\n' | james-shell` has stdout on a
+        // terminal but stdin on a pipe — entering raw mode there would hand
+        // event::read() a non-keyboard stream, causing errors or misparse.
+        if !io::stdin().is_tty() {
             return self.read_line_fallback(prompt);
         }
 
@@ -425,6 +429,7 @@ fn append_to_history_file(path: &std::path::Path, line: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     /// Build a `LineEditor` with a fixed history, bypassing file I/O.
     fn editor_with_history(entries: &[&str]) -> LineEditor {
@@ -514,6 +519,64 @@ mod tests {
         e.cursor = 0;
         e.delete_word_before_cursor();
         assert_eq!(e.buffer.iter().collect::<String>(), "hello");
+        assert_eq!(e.cursor, 0);
+    }
+
+    #[test]
+    fn key_events_edit_buffer_like_terminal() {
+        let mut e = editor_with_history(&[]);
+        let prompt = "jsh> ";
+        let k = |code: KeyCode, mods: KeyModifiers| KeyEvent::new(code, mods);
+
+        e.handle_key(k(KeyCode::Char('h'), KeyModifiers::NONE), prompt)
+            .unwrap();
+        e.handle_key(k(KeyCode::Char('i'), KeyModifiers::NONE), prompt)
+            .unwrap();
+        e.handle_key(k(KeyCode::Left, KeyModifiers::NONE), prompt)
+            .unwrap();
+        e.handle_key(k(KeyCode::Char('i'), KeyModifiers::NONE), prompt)
+            .unwrap();
+        e.handle_key(k(KeyCode::Right, KeyModifiers::NONE), prompt)
+            .unwrap();
+        e.handle_key(k(KeyCode::Backspace, KeyModifiers::NONE), prompt)
+            .unwrap();
+        e.handle_key(k(KeyCode::Home, KeyModifiers::NONE), prompt)
+            .unwrap();
+        e.handle_key(k(KeyCode::Char('H'), KeyModifiers::SHIFT), prompt)
+            .unwrap();
+        e.handle_key(k(KeyCode::End, KeyModifiers::NONE), prompt)
+            .unwrap();
+
+        assert_eq!(e.buffer.iter().collect::<String>(), "Hhi");
+        assert_eq!(e.cursor, e.buffer.len());
+    }
+
+    #[test]
+    fn key_events_support_kill_line_shortcuts() {
+        let mut e = editor_with_history(&[]);
+        let prompt = "jsh> ";
+        let k = |code: KeyCode, mods: KeyModifiers| KeyEvent::new(code, mods);
+
+        e.handle_key(k(KeyCode::Char('a'), KeyModifiers::NONE), prompt)
+            .unwrap();
+        e.handle_key(k(KeyCode::Char('b'), KeyModifiers::NONE), prompt)
+            .unwrap();
+        e.handle_key(k(KeyCode::Char('c'), KeyModifiers::NONE), prompt)
+            .unwrap();
+        e.handle_key(k(KeyCode::Left, KeyModifiers::NONE), prompt)
+            .unwrap();
+        e.handle_key(k(KeyCode::Backspace, KeyModifiers::NONE), prompt)
+            .unwrap();
+
+        assert_eq!(e.buffer.iter().collect::<String>(), "ac");
+        assert_eq!(e.cursor, 1);
+
+        e.handle_key(k(KeyCode::End, KeyModifiers::NONE), prompt)
+            .unwrap();
+        e.handle_key(k(KeyCode::Char('u'), KeyModifiers::CONTROL), prompt)
+            .unwrap();
+
+        assert_eq!(e.buffer.iter().collect::<String>(), "");
         assert_eq!(e.cursor, 0);
     }
 

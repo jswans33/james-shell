@@ -73,16 +73,20 @@ fn builtin_cd(args: &[String], stderr: &mut dyn Write) -> i32 {
         }
     };
 
-    // Save current directory as OLDPWD before changing.
+    let old_dir = std::env::current_dir().ok();
+
+    // On success, update OLDPWD to the directory we left.
     // SAFETY: We only mutate env vars on the main thread. The ctrlc handler
     // thread does not read or write environment variables.
-    if let Ok(cwd) = std::env::current_dir() {
-        unsafe { std::env::set_var("OLDPWD", cwd) };
-    }
-
     if let Err(e) = std::env::set_current_dir(&target) {
         let _ = writeln!(stderr, "cd: {target}: {e}");
         return 1;
+    }
+
+    if let Some(cwd) = old_dir {
+        // SAFETY: We only mutate env vars on the main thread. The ctrlc handler
+        // thread does not read or write environment variables.
+        unsafe { std::env::set_var("OLDPWD", cwd) };
     }
 
     0
@@ -178,6 +182,8 @@ fn builtin_help(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write)
             let _ = writeln!(stdout, "  fg [%N]             Bring job to foreground");
             let _ = writeln!(stdout, "  bg [%N]             Resume stopped job in background");
             let _ = writeln!(stdout, "  wait [%N]           Wait for background job(s)");
+            let _ = writeln!(stdout, "  Stateful builtins (cd/export/unset/fg/bg)");
+            let _ = writeln!(stdout, "    are not supported in non-terminal pipeline steps");
             let _ = writeln!(stdout, "  help [topic]        Show this help or a topic reference");
             let _ = writeln!(stdout, "");
             let _ = writeln!(stdout, "Topics: variables  redirection  jobs  expansion  quotes  exit-codes");
@@ -196,6 +202,7 @@ fn builtin_help(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write)
         Some("pwd") => {
             let _ = writeln!(stdout, "pwd");
             let _ = writeln!(stdout, "  Print the absolute path of the current directory.");
+            let _ = writeln!(stdout, "  This command does not run as a background job.");
             0
         }
         Some("echo") => {

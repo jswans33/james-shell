@@ -5,6 +5,8 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
+use std::fs::File;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -31,12 +33,37 @@ fn run_shell_with_home(lines: &[&str], home: &Path) -> std::process::Output {
     child.wait_with_output().expect("wait output")
 }
 
+fn run_shell_with_home_from_script_file(
+    script_path: &Path,
+    home: &Path,
+) -> std::process::Output {
+    let stdin = File::open(script_path).expect("open script file");
+    let output = Command::new(env!("CARGO_BIN_EXE_james-shell"))
+        .stdin(Stdio::from(stdin))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("HOME", home)
+        .env("USERPROFILE", home)
+        .output()
+        .expect("run james-shell from script file");
+
+    output
+}
+
 /// RAII temp directory — created on construction, deleted on drop.
 struct TempHome(PathBuf);
 
 impl TempHome {
     fn new(label: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("jsh_test_home_{label}"));
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "jsh_test_home_{label}_{}_{}",
+            std::process::id(),
+            unique
+        ));
         std::fs::create_dir_all(&dir).expect("create temp home");
         TempHome(dir)
     }
@@ -77,19 +104,98 @@ fn history_file_written_after_command() {
 }
 
 #[test]
+fn script_file_input_is_fully_consumed_without_raw_mode() {
+    let home = TempHome::new("script_file");
+    let script = home.path().join("session.jsh");
+    std::fs::write(
+        &script,
+        ["echo SCRIPT_FILE_MARKER", "echo SECOND:$?"]
+            .join("\n"),
+    )
+    .expect("write script input");
+
+    let output = run_shell_with_home_from_script_file(&script, home.path());
+    assert!(output.status.success(), "script-fed shell did not exit cleanly");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let first = stdout
+        .find("SCRIPT_FILE_MARKER")
+        .expect("expected marker output");
+    let second = stdout.find("SECOND:0").expect("expected exit-code output");
+    assert!(
+        first < second,
+        "commands did not run in order; stdout was:\n{stdout}"
+    );
+    assert!(stdout.contains("Goodbye!"), "expected EOF shutdown; stdout was:\n{stdout}");
+}
+
+#[test]
+fn script_file_input_has_no_terminal_control_sequences() {
+    let home = TempHome::new("script_no_ansi");
+    let script = home.path().join("plain.jsh");
+    std::fs::write(&script, "echo plain-output").expect("write script input");
+
+    let output = run_shell_with_home_from_script_file(&script, home.path());
+    assert!(output.status.success(), "script-fed shell did not exit cleanly");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains('\u{1b}'),
+        "non-interactive output should not include ANSI escapes; stdout was:\n{stdout}"
+    );
+}
+
+#[test]
 fn history_persists_across_sessions() {
     let home = TempHome::new("persists");
-    let marker = "echo HISTORY_PERSISTENT_MARKER";
+    let s1_marker = "echo SESSION1_HISTORY_MARKER";
+    let s2_marker = "echo SESSION2_HISTORY_MARKER";
 
-    // Session 1: run the distinctive command.
-    let _ = run_shell_with_home(&[marker], home.path());
+    // Session 1: write a distinctive command to disk.
+    let out1 = run_shell_with_home(&[s1_marker], home.path());
+    assert!(out1.status.success(), "session 1 did not exit cleanly");
 
-    // Session 2: a fresh shell instance must still find the entry on disk.
+    // Session 2: a completely fresh process that must load the persisted file
+    // on startup and then append its own command without overwriting.
+    let out2 = run_shell_with_home(&[s2_marker], home.path());
+    assert!(out2.status.success(), "session 2 did not exit cleanly");
+
+    // After session 2 both entries must be present — session 1's entry
+    // survived (load_history didn't overwrite) and session 2's entry was
+    // appended (proving append-mode persistence).
     let contents = std::fs::read_to_string(home.history_path())
-        .expect("read .jsh_history after second session");
+        .expect("read .jsh_history after session 2");
     assert!(
-        contents.contains(marker),
-        "history should persist across sessions; contents:\n{contents}"
+        contents.contains(s1_marker),
+        "session 1 entry missing after session 2;\ncontents:\n{contents}"
+    );
+    assert!(
+        contents.contains(s2_marker),
+        "session 2 entry missing from history;\ncontents:\n{contents}"
+    );
+}
+
+#[test]
+fn history_file_is_appended_instead_of_overwritten() {
+    let home = TempHome::new("history_append");
+    let marker = "echo SESSION_APPEND_MARKER";
+    let seeded_entry = "seeded-history-line";
+    std::fs::write(home.history_path(), format!("{seeded_entry}\n"))
+        .expect("seed history file");
+
+    let output = run_shell_with_home(&[marker], home.path());
+    assert!(output.status.success(), "shell did not exit cleanly");
+
+    let contents = std::fs::read_to_string(home.history_path())
+        .expect("read .jsh_history after session");
+    let lines: Vec<_> = contents.lines().collect();
+    assert!(
+        lines.first() == Some(&seeded_entry),
+        "expected seeded entry to remain first; contents:\n{contents}"
+    );
+    assert!(
+        lines.contains(&"echo SESSION_APPEND_MARKER"),
+        "append marker missing; contents:\n{contents}"
     );
 }
 
