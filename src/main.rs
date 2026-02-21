@@ -1,8 +1,9 @@
 use james_shell::{
+    ast::Connector,
     editor::{LineEditor, EDITOR_ACTIVE},
     executor, expander,
     jobs::JobTable,
-    parser, redirect,
+    parser, redirect, script_parser,
 };
 use std::io::{self, Write};
 use std::sync::atomic::Ordering;
@@ -68,7 +69,13 @@ fn main() {
         let input = match editor.read_line("jsh> ") {
             Ok(Some(line)) => line,
             Ok(None) => {
-                println!("Goodbye!");
+                // Only print the goodbye message for interactive sessions.
+                // Child shells spawned for whole-chain background execution read
+                // from a pipe, not a TTY, and must not print to the terminal.
+                use std::io::IsTerminal;
+                if std::io::stdin().is_terminal() {
+                    println!("Goodbye!");
+                }
                 break;
             }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {
@@ -89,7 +96,7 @@ fn main() {
         // consistent with bash behaviour.
         editor.add_to_history(trimmed);
 
-        // Parse into quote-aware words and split pipeline segments.
+        // Parse into quote-aware words.
         let mut words = match parser::parse_words(trimmed) {
             Ok(words) => words,
             Err(msg) => {
@@ -100,6 +107,7 @@ fn main() {
         };
 
         // Detect a trailing `&` background operator and strip it.
+        // When present, the last pipeline in the chain runs in the background.
         // The command text (for display in `jobs`) is the line without `&`.
         let background = words
             .last()
@@ -112,8 +120,9 @@ fn main() {
             .trim_end_matches(|c: char| c == '&' || c == ' ')
             .to_string();
 
-        let pipeline_words = match parser::split_pipeline(&words) {
-            Ok(words) => words,
+        // Split by chain operators (&&, ||, ;) into ordered entries.
+        let chain = match script_parser::parse_chain(words) {
+            Ok(chain) => chain,
             Err(msg) => {
                 eprintln!("{msg}");
                 last_exit_code = 2;
@@ -121,70 +130,174 @@ fn main() {
             }
         };
 
-        let mut commands = Vec::new();
-        let mut had_parse_error = false;
+        if chain.is_empty() {
+            continue;
+        }
 
-        for segment_words in pipeline_words {
-            let (words, redirections) = match
-                redirect::extract_redirections_from_words(&segment_words, last_exit_code)
-            {
-                Ok(pair) => pair,
+        // Phase 1 — Pre-validate pipeline structure for every chain entry up-front.
+        //
+        // This separates STATIC structural validation (pipeline token layout: does
+        // every `|` have a command on each side?) from DYNAMIC evaluation (word
+        // expansion and redirect resolution, which depend on runtime state like $?).
+        //
+        // Validating all entries now means a syntax error in a branch that would be
+        // short-circuited by && / || is still reported, rather than silently ignored
+        // because the branch happened not to run.
+        let mut pre_validated: Vec<(Vec<Vec<parser::Word>>, Connector)> = Vec::new();
+        let mut syntax_ok = true;
+
+        for entry in &chain {
+            match parser::split_pipeline(&entry.words) {
+                Ok(pipeline_words) => {
+                    pre_validated.push((pipeline_words, entry.connector.clone()));
+                }
                 Err(msg) => {
                     eprintln!("{msg}");
+                    last_exit_code = 2;
+                    syntax_ok = false;
+                    break;
+                }
+            }
+        }
+
+        if !syntax_ok {
+            continue;
+        }
+
+        // Phase 2 — Whole-chain background.
+        //
+        // When the line ends with `&` and the chain has more than one entry, the
+        // entire chain must run as a single background job so that && / || exit-code
+        // semantics work correctly inside it.  A simple per-entry background flag
+        // cannot achieve this: backgrounding an early entry returns immediately with
+        // an unknown exit code, so && / || gates become meaningless.
+        //
+        // The solution: spawn a child james-shell process and feed it the command
+        // text on stdin.  The child executes the full chain in its foreground while
+        // the parent shell registers it as a background job and returns the prompt.
+        // (Single-entry chains continue to use the per-command background path below.)
+        if background && pre_validated.len() > 1 {
+            let exe = std::env::current_exe()
+                .unwrap_or_else(|_| std::path::PathBuf::from("james-shell"));
+            match std::process::Command::new(&exe)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::inherit())
+                .stderr(std::process::Stdio::inherit())
+                .spawn()
+            {
+                Ok(mut child) => {
+                    // Write the command text and signal EOF so the child shell
+                    // executes the chain and exits cleanly.
+                    if let Some(mut stdin) = child.stdin.take() {
+                        let _ = writeln!(stdin, "{command_text}");
+                        // stdin drops here, closing the pipe and triggering EOF
+                    }
+                    let (job_id, pid) = job_table.add(child, command_text.clone());
+                    println!("[{job_id}] {pid}");
+                    last_exit_code = 0;
+                }
+                Err(e) => {
+                    eprintln!("jsh: failed to spawn background shell: {e}");
+                    last_exit_code = 1;
+                }
+            }
+            continue; // prompt is ready; the chain runs in the child
+        }
+
+        // Phase 3 — Execute chain entries with short-circuit logic.
+        //
+        // We iterate the pre-validated pipeline segments (so split_pipeline is not
+        // called a second time).  Word expansion and redirect resolution happen here
+        // because they depend on the runtime value of $? after each entry runs.
+        let mut should_exit = false;
+
+        for (i, (pipeline_words, connector)) in pre_validated.into_iter().enumerate() {
+            // Decide whether this entry should run based on the connector and
+            // the exit code left by the previous entry.
+            let should_run = match connector {
+                Connector::Sequence => true,
+                Connector::And => last_exit_code == 0,
+                Connector::Or => last_exit_code != 0,
+            };
+            if !should_run {
+                continue;
+            }
+
+            // For single-entry chains, the background flag is passed through to the
+            // executor as normal.  Multi-entry chains with & are handled in Phase 2
+            // above, so this path is only reached when entry_count == 1.
+            let entry_background = background && (i == 0);
+
+            let mut commands = Vec::new();
+            let mut had_parse_error = false;
+
+            for segment_words in pipeline_words {
+                let (seg_words, redirections) = match
+                    redirect::extract_redirections_from_words(&segment_words, last_exit_code)
+                {
+                    Ok(pair) => pair,
+                    Err(msg) => {
+                        eprintln!("{msg}");
+                        last_exit_code = 2;
+                        had_parse_error = true;
+                        break;
+                    }
+                };
+
+                let args = expander::expand_words(&seg_words, last_exit_code);
+                if args.is_empty() {
+                    eprintln!("jsh: syntax error: empty command");
                     last_exit_code = 2;
                     had_parse_error = true;
                     break;
                 }
-            };
 
-            let args = expander::expand_words(&words, last_exit_code);
-            if args.is_empty() {
-                eprintln!("jsh: syntax error: empty command");
-                last_exit_code = 2;
-                had_parse_error = true;
+                let command = parser::Command {
+                    program: args[0].clone(),
+                    args: args[1..].to_vec(),
+                };
+                commands.push(executor::PipelineCommand { command, redirections });
+            }
+
+            if had_parse_error || commands.is_empty() {
+                if commands.is_empty() && !had_parse_error {
+                    last_exit_code = 2;
+                }
                 break;
             }
 
-            let command = parser::Command {
-                program: args[0].clone(),
-                args: args[1..].to_vec(),
+            let action = if commands.len() == 1 {
+                let command = commands.swap_remove(0);
+                executor::execute(
+                    &command.command,
+                    &command.redirections,
+                    entry_background,
+                    &mut job_table,
+                    &command_text,
+                )
+            } else {
+                executor::execute_pipeline(
+                    commands,
+                    entry_background,
+                    &mut job_table,
+                    &command_text,
+                )
             };
-            commands.push(executor::PipelineCommand { command, redirections });
+
+            match action {
+                executor::ExecutionAction::Continue(code) => {
+                    last_exit_code = code;
+                }
+                executor::ExecutionAction::Exit(code) => {
+                    last_exit_code = code;
+                    should_exit = true;
+                    break;
+                }
+            }
         }
 
-        if had_parse_error || commands.is_empty() {
-            if commands.is_empty() && !had_parse_error && last_exit_code == 0 {
-                last_exit_code = 2;
-            }
-            continue;
-        }
-
-        let action = if commands.len() == 1 {
-            let command = commands.swap_remove(0);
-            executor::execute(
-                &command.command,
-                &command.redirections,
-                background,
-                &mut job_table,
-                &command_text,
-            )
-        } else {
-            executor::execute_pipeline(
-                commands,
-                background,
-                &mut job_table,
-                &command_text,
-            )
-        };
-
-        match action {
-            executor::ExecutionAction::Continue(code) => {
-                last_exit_code = code;
-            }
-            executor::ExecutionAction::Exit(code) => {
-                last_exit_code = code;
-                break;
-            }
+        if should_exit {
+            break;
         }
     }
 

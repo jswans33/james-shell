@@ -1,3 +1,4 @@
+pub mod ast;
 pub mod builtins;
 pub mod editor;
 pub mod executor;
@@ -6,4 +7,5 @@ pub mod job_control;
 pub mod jobs;
 pub mod parser;
 pub mod redirect;
+pub mod script_parser;
 pub mod status;

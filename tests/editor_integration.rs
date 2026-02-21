@@ -126,7 +126,9 @@ fn script_file_input_is_fully_consumed_without_raw_mode() {
         first < second,
         "commands did not run in order; stdout was:\n{stdout}"
     );
-    assert!(stdout.contains("Goodbye!"), "expected EOF shutdown; stdout was:\n{stdout}");
+    // Clean exit is verified by output.status.success() above.
+    // "Goodbye!" is only printed for interactive (TTY) sessions; non-interactive
+    // script mode exits cleanly without it.
 }
 
 #[test]

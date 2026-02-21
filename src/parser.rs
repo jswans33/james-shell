@@ -95,12 +95,25 @@ pub fn tokenize(input: &str) -> Result<Vec<Word>, String> {
                 state = State::InWord;
             }
             (State::Normal, '|') => {
-                // Pipe operator — treat as a segment separator.
-                words.push(vec![WordSegment::Unquoted("|".to_string())]);
+                // `||` is a chain-or operator; bare `|` is a pipe.
+                if chars.peek() == Some(&'|') {
+                    chars.next();
+                    words.push(vec![WordSegment::Unquoted("||".to_string())]);
+                } else {
+                    words.push(vec![WordSegment::Unquoted("|".to_string())]);
+                }
             }
             (State::Normal, '&') => {
-                // Background operator — emit as a standalone token.
-                words.push(vec![WordSegment::Unquoted("&".to_string())]);
+                // `&&` is a chain-and operator; bare `&` is background.
+                if chars.peek() == Some(&'&') {
+                    chars.next();
+                    words.push(vec![WordSegment::Unquoted("&&".to_string())]);
+                } else {
+                    words.push(vec![WordSegment::Unquoted("&".to_string())]);
+                }
+            }
+            (State::Normal, ';') => {
+                words.push(vec![WordSegment::Unquoted(";".to_string())]);
             }
             (State::Normal, '>' | '<') => {
                 // Redirect operator — emit as its own token
@@ -148,25 +161,46 @@ pub fn tokenize(input: &str) -> Result<Vec<Word>, String> {
                 }
             }
             (State::InWord, '|') => {
-                // Pipe inside a word breaks tokenization.
+                // `||` is chain-or; bare `|` is a pipe. Both break a word.
                 if !current_segment.is_empty() {
                     current_word.push(WordSegment::Unquoted(std::mem::take(&mut current_segment)));
                 }
                 if !current_word.is_empty() {
                     words.push(std::mem::take(&mut current_word));
                 }
-                words.push(vec![WordSegment::Unquoted("|".to_string())]);
+                if chars.peek() == Some(&'|') {
+                    chars.next();
+                    words.push(vec![WordSegment::Unquoted("||".to_string())]);
+                } else {
+                    words.push(vec![WordSegment::Unquoted("|".to_string())]);
+                }
                 state = State::Normal;
             }
             (State::InWord, '&') => {
-                // Background operator breaks a word just like pipe does.
+                // `&&` is chain-and; bare `&` is background. Both break a word.
                 if !current_segment.is_empty() {
                     current_word.push(WordSegment::Unquoted(std::mem::take(&mut current_segment)));
                 }
                 if !current_word.is_empty() {
                     words.push(std::mem::take(&mut current_word));
                 }
-                words.push(vec![WordSegment::Unquoted("&".to_string())]);
+                if chars.peek() == Some(&'&') {
+                    chars.next();
+                    words.push(vec![WordSegment::Unquoted("&&".to_string())]);
+                } else {
+                    words.push(vec![WordSegment::Unquoted("&".to_string())]);
+                }
+                state = State::Normal;
+            }
+            (State::InWord, ';') => {
+                // Semicolon breaks a word and acts as a sequence separator.
+                if !current_segment.is_empty() {
+                    current_word.push(WordSegment::Unquoted(std::mem::take(&mut current_segment)));
+                }
+                if !current_word.is_empty() {
+                    words.push(std::mem::take(&mut current_word));
+                }
+                words.push(vec![WordSegment::Unquoted(";".to_string())]);
                 state = State::Normal;
             }
             (State::InWord, '>' | '<') => {
@@ -580,8 +614,65 @@ mod tests {
 
     #[test]
     fn split_pipeline_errors_on_consecutive_pipes() {
-        let words = tokenize("echo hi || tr").unwrap();
+        // Two pipe characters separated by whitespace — still a syntax error.
+        let words = tokenize("echo hi | | tr").unwrap();
         assert!(split_pipeline(&words).is_err());
+    }
+
+    #[test]
+    fn double_pipe_is_chain_or_token() {
+        // `||` must be a single chain-or token, not two pipe tokens.
+        let strings: Vec<String> = tokenize("echo hi || echo bye")
+            .unwrap()
+            .iter()
+            .map(|w| {
+                w.iter()
+                    .map(|seg| match seg {
+                        WordSegment::Unquoted(s)
+                        | WordSegment::DoubleQuoted(s)
+                        | WordSegment::SingleQuoted(s) => s.as_str(),
+                    })
+                    .collect::<String>()
+            })
+            .collect();
+        assert_eq!(strings, vec!["echo", "hi", "||", "echo", "bye"]);
+    }
+
+    #[test]
+    fn double_amp_is_chain_and_token() {
+        // `&&` must be a single chain-and token, not two background tokens.
+        let strings: Vec<String> = tokenize("echo hi && echo bye")
+            .unwrap()
+            .iter()
+            .map(|w| {
+                w.iter()
+                    .map(|seg| match seg {
+                        WordSegment::Unquoted(s)
+                        | WordSegment::DoubleQuoted(s)
+                        | WordSegment::SingleQuoted(s) => s.as_str(),
+                    })
+                    .collect::<String>()
+            })
+            .collect();
+        assert_eq!(strings, vec!["echo", "hi", "&&", "echo", "bye"]);
+    }
+
+    #[test]
+    fn semicolon_is_sequence_token() {
+        let strings: Vec<String> = tokenize("echo a ; echo b")
+            .unwrap()
+            .iter()
+            .map(|w| {
+                w.iter()
+                    .map(|seg| match seg {
+                        WordSegment::Unquoted(s)
+                        | WordSegment::DoubleQuoted(s)
+                        | WordSegment::SingleQuoted(s) => s.as_str(),
+                    })
+                    .collect::<String>()
+            })
+            .collect();
+        assert_eq!(strings, vec!["echo", "a", ";", "echo", "b"]);
     }
 
     #[test]
